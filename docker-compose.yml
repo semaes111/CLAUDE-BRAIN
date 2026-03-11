@@ -1,0 +1,302 @@
+version: "3.8"
+
+# ════════════════════════════════════════════════════════════
+# CLAUDE-BRAIN — Docker Compose Stack
+# Motor: claude --print (Max OAuth, $0 API billing extra)
+# ════════════════════════════════════════════════════════════
+
+services:
+
+  # ═══════════════════════════════════════
+  # NGINX — Reverse proxy + SSL
+  # ═══════════════════════════════════════
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/conf.d:/etc/nginx/conf.d:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    depends_on: [agent-api, webui, n8n]
+    restart: unless-stopped
+    networks: [internal]
+
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - certbot_certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    entrypoint: >
+      sh -c "certonly --webroot -w /var/www/certbot
+             -d ${DOMAIN} --email ${EMAIL}
+             --agree-tos --non-interactive --keep-until-expiring"
+
+  # ═══════════════════════════════════════
+  # AGENT API — Motor principal
+  # Usa claude --print con Max OAuth (sin API billing)
+  # ═══════════════════════════════════════
+  agent-api:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    environment:
+      # ⚠️ ANTHROPIC_API_KEY ausente = usa Max OAuth
+      - SUPABASE_URL=http://supabase-kong:8000
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - N8N_API_KEY=${N8N_API_KEY}
+      - EMBEDDING_URL=http://embeddings:8080
+      - AGENT_MAX_TURNS=${AGENT_MAX_TURNS:-25}
+      - AGENT_TIMEOUT_SECONDS=${AGENT_TIMEOUT_SECONDS:-300}
+      - AGENT_MAX_SUBAGENTS=${AGENT_MAX_SUBAGENTS:-4}
+    volumes:
+      # Credenciales OAuth de Claude Code (autenticar previamente en el VPS)
+      - ${HOME}/.claude:/root/.claude:ro
+      - agent_workspaces:/workspaces
+      - ./skills:/app/skills:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      redis:
+        condition: service_healthy
+      supabase-db:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+      snekbox:
+        condition: service_started
+    networks: [internal, sandbox-net]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
+
+  # ═══════════════════════════════════════
+  # WEB UI — LibreChat
+  # ═══════════════════════════════════════
+  webui:
+    image: ghcr.io/danny-avila/librechat:latest
+    environment:
+      - MONGO_URI=${MONGO_URI:-mongodb://mongodb:27017/librechat}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AGENT_API_URL=http://agent-api:8000
+    volumes:
+      - ./config/librechat/librechat.yaml:/app/librechat.yaml:ro
+      - librechat_uploads:/app/client/public/images
+    depends_on: [mongodb]
+    networks: [internal]
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    volumes: [mongodb_data:/data/db]
+    networks: [internal]
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════
+  # SANDBOX — Ejecución segura de código
+  # Python/JS/Bash aislados con nsjail
+  # ═══════════════════════════════════════
+  snekbox:
+    image: ghcr.io/python-discord/snekbox:latest
+    ipc: none
+    privileged: true
+    networks: [sandbox-net]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    restart: unless-stopped
+
+  sandbox-api:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    environment:
+      - SNEKBOX_URL=http://snekbox:8060
+    networks: [internal, sandbox-net]
+    depends_on: [snekbox]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+  # ═══════════════════════════════════════
+  # REDIS — Working memory
+  # ═══════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD}
+    volumes: [redis_data:/data]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════
+  # SUPABASE — PostgreSQL + pgvector + Auth + REST
+  # Long-term memory + datos de la app
+  # ═══════════════════════════════════════
+  supabase-db:
+    image: supabase/postgres:15.6.1.143
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - supabase_db:/var/lib/postgresql/data
+      - ./config/supabase/01-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql
+      - ./config/supabase/02-memories.sql:/docker-entrypoint-initdb.d/02-memories.sql
+      - ./config/supabase/03-n8n.sql:/docker-entrypoint-initdb.d/03-n8n.sql
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  supabase-kong:
+    image: kong:2.8.1
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl
+    volumes:
+      - ./config/supabase/kong.yml:/var/lib/kong/kong.yml:ro
+    depends_on: [supabase-db]
+    networks: [internal]
+    restart: unless-stopped
+
+  supabase-auth:
+    image: supabase/gotrue:v2.158.1
+    environment:
+      GOTRUE_DB_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_SITE_URL: https://${DOMAIN}
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      GOTRUE_DISABLE_SIGNUP: "false"
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks: [internal]
+    restart: unless-stopped
+
+  supabase-rest:
+    image: postgrest/postgrest:v12.2.3
+    environment:
+      PGRST_DB_URI: postgres://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_SCHEMAS: public,storage,extensions
+      PGRST_DB_ANON_ROLE: anon
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks: [internal]
+    restart: unless-stopped
+
+  supabase-studio:
+    image: supabase/studio:20241028-a265374
+    environment:
+      SUPABASE_URL: http://supabase-kong:8000
+      SUPABASE_KEY: ${SUPABASE_SERVICE_KEY}
+      STUDIO_PG_META_URL: http://supabase-meta:8080
+    depends_on: [supabase-kong]
+    networks: [internal]
+    restart: unless-stopped
+
+  supabase-meta:
+    image: supabase/postgres-meta:v0.83.2
+    environment:
+      PG_META_DB_HOST: supabase-db
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks: [internal]
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════
+  # N8N — Automatización de workflows
+  # ═══════════════════════════════════════
+  n8n:
+    image: n8nio/n8n:latest
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD}
+      - N8N_HOST=n8n.${DOMAIN}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://n8n.${DOMAIN}/
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=supabase-db
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=postgres
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - AGENT_API_URL=http://agent-api:8000
+    volumes: [n8n_data:/home/node/.n8n]
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks: [internal]
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════
+  # EMBEDDINGS — nomic-embed-text-v1.5 LOCAL
+  # Reemplaza OpenAI embeddings API ($0/mes)
+  # Modelo: 768 dims, 8192 ctx, ~270MB
+  # ═══════════════════════════════════════
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    command: --model-id nomic-ai/nomic-embed-text-v1.5 --port 8080
+    volumes: [embeddings_cache:/data]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+    restart: unless-stopped
+
+networks:
+  internal:
+    driver: bridge
+  sandbox-net:
+    driver: bridge
+    internal: true  # Sin acceso a internet desde sandbox
+
+volumes:
+  redis_data:
+  supabase_db:
+  mongodb_data:
+  mongodb_data:
+  n8n_data:
+  agent_workspaces:
+  embeddings_cache:
+  certbot_certs:
+  certbot_www:
+  librechat_uploads:

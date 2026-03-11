@@ -1,0 +1,48 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+.npm
+
+# Docker volumes (no versionar datos)
+data/
+
+# SSL certificates (generados por certbot)
+config/nginx/ssl/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Workspaces del agente (datos de usuario)
+workspaces/
+
+# Credenciales Claude (NUNCA versionar)
+.claude/
+*.credentials.json
