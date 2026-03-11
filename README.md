@@ -1,160 +1,184 @@
 # 🧠 CLAUDE-BRAIN
 
-> Autonomous AI Agent powered by **Claude Code Max** — Zero extra API billing.
+> Agente IA autónomo con **Claude Code Max** — 100% Docker, cero instalación en el host, cero API billing extra.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Claude Code](https://img.shields.io/badge/Claude%20Code-Max%20%24200%2Fmo-orange)](https://claude.ai)
 [![Docker](https://img.shields.io/badge/Docker-Compose-blue)](docker-compose.yml)
+[![Claude Code Max](https://img.shields.io/badge/Claude%20Code-Max%20OAuth-orange)](https://claude.ai)
 
-## 🎯 Concepto clave
+## 🎯 Concepto
 
-| ❌ API billing tradicional | ✅ CLAUDE-BRAIN |
-|---|---|
-| `anthropic.Anthropic()` → paga por token | `claude --print` vía subprocess → usa Max OAuth |
-| Claude Agent SDK → requiere API key | CLI built-in tools → incluido en plan |
-| OpenAI embeddings → $$/mes | `nomic-embed-text` local → $0/mes |
-| Supabase Cloud → $25/mes | Supabase self-hosted → $0/mes |
-| **Total: $300-800/mes** | **Total: €200 (plan) + €25 VPS** |
-
-## 🏗️ Arquitectura
+El agente corre **completamente dentro de Docker**. El host solo necesita Docker instalado.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  VPS Ubuntu + Docker                  │
-│                                                       │
-│  NGINX ──► LibreChat (UI) ──► Agent API (FastAPI)    │
-│                                    │                  │
-│                         ClaudeMaxRunner               │
-│                    subprocess("claude --print")       │
-│                    ← Max OAuth, $0 extra →            │
-│                                    │                  │
-│         ┌──────────────────────────┼──────────────┐  │
-│      Sandbox    GitHub    n8n    Supabase  Memory  │  │
-│      (snekbox)  (PyGH)  (REST)  (pgvector)(Redis)  │  │
-└─────────────────────────────────────────────────────┘
+HOST (VPS o local)
+└── Docker Engine
+    ├── cb-agent      ← claude CLI instalado aquí (Max OAuth)
+    ├── cb-redis      ← Working memory
+    ├── cb-postgres   ← Long-term memory (pgvector)
+    ├── cb-embeddings ← nomic-embed-text-v1.5 ($0/mes)
+    ├── cb-n8n        ← Automatización
+    ├── cb-webui      ← LibreChat UI
+    ├── cb-snekbox    ← Sandbox Python (nsjail)
+    └── ...
 ```
 
-## 🚀 Capacidades
+### Por qué $0 de API extra
 
-- **🔧 Ejecución de código** — Python, JS, Bash en sandbox aislado (nsjail)
-- **🔍 Búsqueda web** — WebSearch + WebFetch (built-in del CLI, gratis)
-- **📁 GitHub** — Clone, commit, push, PR automáticos
-- **🧠 Memoria persistente** — Redis (working) + pgvector (long-term)
-- **⚡ Next.js + Supabase** — Desarrollo full-stack integrado
-- **🔄 n8n** — Automatización de workflows bidireccional
-- **📦 Skills modulares** — Sistema SKILL.md extensible
-- **🤝 Multi-agente** — Orquestador + subagentes paralelos
+```
+❌  anthropic.Anthropic()   → Cobra por token (API billing separado)
+✅  claude --print "tarea"  → Usa Max OAuth ($0 extra)
+```
 
-## 📋 Requisitos
+El `ClaudeMaxRunner` invoca el CLI vía `subprocess` **sin** `ANTHROPIC_API_KEY` en el entorno.
+Sin esa variable, el CLI usa automáticamente las credenciales OAuth del Max plan.
 
-- VPS Ubuntu 22.04/24.04 con **8GB RAM mínimo** (16GB recomendado)
-- Docker + Docker Compose v2
-- **Claude Code Max plan** ($100 o $200/mes) — autenticado con OAuth
-- GitHub Personal Access Token (scope: `repo`)
+## 🚀 Inicio rápido
 
-## ⚡ Instalación rápida
+### Prerequisitos
+- Docker Engine >= 24 + Docker Compose v2
+- Cuenta Claude Code Max ($100 o $200/mes)
+- Eso es todo
+
+### Setup en 3 pasos
 
 ```bash
-# 1. Clonar el repo
+# 1. Clonar
 git clone https://github.com/semaes111/CLAUDE-BRAIN.git
 cd CLAUDE-BRAIN
 
-# 2. Configurar variables de entorno
+# 2. Configurar
 cp .env.example .env
-nano .env   # Añadir tus credenciales
+# Editar .env: añadir GITHUB_TOKEN, credenciales Supabase, etc.
 
-# 3. Autenticar Claude Code con Max OAuth (en el VPS)
-npm install -g @anthropic-ai/claude-code
-claude auth login   # Abre URL en tu browser local
+# 3. Arrancar todo
+chmod +x scripts/install.sh && ./scripts/install.sh
+```
 
-# 4. Verificar autenticación (debe usar Max, no API billing)
-unset ANTHROPIC_API_KEY
-claude --print "di VERIFICADO"
+### Autenticar Claude Code Max (una vez)
 
-# 5. Levantar stack completo
+**Opción A — Exportar credenciales existentes (recomendada):**
+```bash
+# Si ya tienes Claude Code autenticado en tu máquina:
+./scripts/setup-auth.sh
+# → Detecta ~/.claude/.credentials.json y lo exporta al .env automáticamente
+```
+
+**Opción B — Auth dentro del contenedor:**
+```bash
 docker compose up -d --build
+docker compose exec agent-api claude auth login
+# → Genera URL → la abres en tu browser → autorizas
+# → Credenciales guardadas en volumen Docker persistente (cb-claude-auth)
+```
 
-# 6. Verificar
+**Verificar:**
+```bash
+docker compose exec agent-api claude --print "di hola"
+# → Responde sin pedir API key = está usando Max OAuth ✅
+```
+
+## 📡 Endpoints
+
+| URL | Descripción |
+|-----|-------------|
+| `http://localhost:3080` | Web UI (LibreChat) |
+| `http://localhost:8000` | Agent API |
+| `http://localhost:8000/docs` | Swagger UI |
+| `http://localhost:5678` | n8n workflows |
+| `http://localhost:8001` | Supabase Studio |
+
+### Uso básico de la API
+
+```bash
+# Chat simple
+curl -X POST http://localhost:8000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "crea un endpoint FastAPI para listar usuarios"}'
+
+# Con skill activada
+curl -X POST http://localhost:8000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "crea auth con Supabase", "skill_names": ["nextjs-supabase-dev"]}'
+
+# Streaming en tiempo real
+curl -N "http://localhost:8000/v1/chat/stream?message=explica+pgvector"
+
+# Ejecutar código en sandbox
+curl -X POST http://localhost:8000/v1/execute \
+  -H "Content-Type: application/json" \
+  -d '{"code": "print(sum(range(100)))", "language": "python"}'
+
+# Estado del sistema
 curl http://localhost:8000/v1/status
 ```
 
-## 📁 Estructura del proyecto
+## 🧩 Skills incluidas
+
+| Skill | Activar con |
+|-------|-------------|
+| `nextjs-supabase-dev` | Next.js 15 + App Router + Supabase + RLS |
+| `github-ops` | Clone, PR, branch, commit automático |
+| `n8n-workflows` | Crear y ejecutar workflows n8n |
+| `code-review` | Auditoría de seguridad y calidad |
+| `web-research` | Investigación web multi-fuente |
+
+## 📁 Estructura
 
 ```
 CLAUDE-BRAIN/
 ├── agent/
-│   ├── core/           # ClaudeMaxRunner — motor central (subprocess CLI)
-│   ├── memory/         # Redis + pgvector + extracción automática
-│   ├── skills/         # SkillManager (SKILL.md loader)
-│   ├── orchestrator/   # Multi-agent coordinator
-│   └── api/            # FastAPI REST + WebSocket streaming
-├── sandbox/            # Sandbox executor (snekbox/nsjail)
-├── skills/             # Skills SKILL.md (nextjs, github, n8n, etc.)
+│   ├── core/claude_runner.py        ← Motor: subprocess("claude --print")
+│   ├── memory/memory_manager.py     ← Redis + pgvector + extracción auto
+│   ├── skills/skill_manager.py      ← SKILL.md loader
+│   ├── orchestrator/multi_agent.py  ← Parallel/pipeline con semáforo
+│   ├── api/main.py                  ← FastAPI REST + SSE + WebSocket
+│   ├── entrypoint.sh                ← Auth OAuth en Docker
+│   └── Dockerfile
+├── sandbox/                         ← snekbox + Docker executor
+├── skills/                          ← 5 skills SKILL.md
 ├── config/
-│   ├── nginx/          # Reverse proxy + SSL
-│   ├── supabase/       # Init SQL (pgvector, memories)
-│   └── librechat/      # Configuración UI
-├── webui/              # LibreChat config
-├── scripts/            # install.sh, setup-ssl.sh
-├── docs/               # Arquitectura técnica completa
-├── docker-compose.yml  # Stack completo
-└── .env.example        # Template de variables
+│   ├── nginx/                       ← Reverse proxy + SSL
+│   └── supabase/                    ← SQL pgvector + memorias
+├── scripts/
+│   ├── install.sh                   ← Setup en un comando
+│   └── setup-auth.sh                ← Export credenciales Max
+├── docs/ARCHITECTURE.md
+├── docker-compose.yml               ← 11 servicios
+└── .env.example
 ```
 
-## 🧩 Sistema de Skills
+## 💰 Costos
 
-Las skills extienden las capacidades del agente. Añade nuevas copiando el patrón:
+| Componente | Costo |
+|------------|-------|
+| Claude Code Max (ya lo tienes) | €200/mes |
+| VPS o servidor local | €20-60/mes |
+| Todos los demás servicios | €0 (self-hosted en Docker) |
+| **Total adicional** | **€20-60/mes** |
+
+## 🔧 Comandos útiles
 
 ```bash
-# Activar una skill en una petición
-curl -X POST http://localhost:8000/v1/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Crea una app Next.js con auth", "skill_names": ["nextjs-supabase-dev"]}'
+# Ver logs del agente
+docker compose logs -f agent-api
+
+# Reiniciar solo el agente
+docker compose restart agent-api
+
+# Abrir shell en el agente
+docker compose exec agent-api bash
+
+# Ver uso de recursos
+docker stats
+
+# Parar todo
+docker compose down
+
+# Parar y borrar volúmenes (¡elimina datos!)
+docker compose down -v
 ```
-
-Skills incluidas:
-- `nextjs-supabase-dev` — Next.js 15 + Supabase + Auth + RLS
-- `github-ops` — Clone, PR, branch, commit automáticos
-- `n8n-workflows` — Crear y ejecutar workflows n8n
-- `code-review` — Revisión de código con mejoras
-- `web-research` — Investigación web profunda
-
-## 📊 Estimación de costos
-
-| Componente | Costo/mes |
-|---|---|
-| Claude Code Max (ya lo tienes) | €200 |
-| VPS 8-16GB RAM | €20-50 |
-| nomic-embed-text (local) | €0 |
-| Supabase self-hosted | €0 |
-| n8n self-hosted | €0 |
-| **TOTAL adicional** | **€20-50** |
-
-## 🔗 API Endpoints
-
-| Endpoint | Método | Descripción |
-|---|---|---|
-| `/v1/chat` | POST | Chat con agente (usa Max OAuth) |
-| `/v1/chat/stream` | GET | Streaming SSE en tiempo real |
-| `/ws/{session_id}` | WS | WebSocket bidireccional |
-| `/v1/skills` | GET | Listar skills disponibles |
-| `/v1/memory/search` | GET | Búsqueda semántica en memoria |
-| `/v1/status` | GET | Health check del sistema |
-
-## 📖 Documentación
-
-- [Arquitectura técnica completa](docs/ARCHITECTURE.md)
-- [Guía de instalación detallada](docs/INSTALLATION.md)
-- [Crear skills personalizadas](docs/SKILLS.md)
-- [Multi-agente: patrones y ejemplos](docs/MULTI_AGENT.md)
-- [FAQ y troubleshooting](docs/FAQ.md)
-
-## ⚠️ Limitaciones conocidas
-
-1. **Rate limits del Max plan**: Compartidos entre claude.ai, Desktop y CLI. Max 20x tiene límites altos pero no ilimitados.
-2. **Agent SDK no compatible**: El SDK Python requiere API Key. Usamos CLI subprocess como workaround.
-3. **Subagentes comparten cuota**: Máximo 3-5 subagentes simultáneos recomendado.
 
 ## 📄 Licencia
 
-MIT — Ver [LICENSE](LICENSE)
+MIT
