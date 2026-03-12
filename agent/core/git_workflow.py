@@ -12,7 +12,8 @@ import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+
+from agent.config import settings
 
 
 @dataclass
@@ -20,8 +21,8 @@ class GitContext:
     repo_url:   str
     branch:     str
     work_dir:   Path
-    issue_num:  Optional[int] = None
-    pr_url:     Optional[str] = None
+    issue_num:  int | None = None
+    pr_url:     str | None = None
 
 
 class GitWorkflow:
@@ -39,10 +40,10 @@ class GitWorkflow:
 
     GITHUB_API = "https://api.github.com"
 
-    def __init__(self, github_token: str = "", work_base: str = "/workspaces"):
-        self.token     = github_token or os.getenv("GITHUB_TOKEN", "")
-        self.work_base = Path(work_base)
-        self._ctx: Optional[GitContext] = None
+    def __init__(self, github_token: str = "", work_base: str | None = None):
+        self.token     = github_token or settings.github_token
+        self.work_base = Path(work_base or settings.workdir)
+        self._ctx: GitContext | None = None
 
     async def _run(self, cmd: str, cwd: str = None) -> tuple[bool, str]:
         """Ejecuta comando git y retorna (success, output)."""

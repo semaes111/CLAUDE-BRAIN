@@ -21,16 +21,17 @@ Patrón de uso:
 
 import asyncio
 import hashlib
+import json
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Optional
 
 import redis
 from supabase import create_client, Client
 
+from agent.config import settings
 from agent.core.veracity import compute_degradation_score
 
 
@@ -44,14 +45,14 @@ class InteractionEvent:
     session_id: str = ""
     task_preview: str = ""          # Primeros 200 chars de la tarea
     task_hash: str = ""             # SHA256 de la tarea completa
-    agent_used: Optional[str] = None
+    agent_used: str | None = None
     skills_used: list = field(default_factory=list)
-    command_used: Optional[str] = None
+    command_used: str | None = None
     routing_reasoning: str = ""
     routing_confidence: float = 0.0
     response_preview: str = ""      # Primeros 500 chars de la respuesta
     success: bool = True
-    error: Optional[str] = None
+    error: str | None = None
     latency_ms: int = 0
     tokens_estimated: int = 0       # Estimación: chars/4
     started_at: float = field(default_factory=time.time)
@@ -137,13 +138,10 @@ class Watcher:
     RATE_KEY    = "watcher:rate:{window}"
 
     def __init__(self):
-        self._redis = redis.from_url(
-            os.getenv("REDIS_URL", "redis://redis:6379"),
-            decode_responses=True
-        )
+        self._redis = redis.from_url(settings.redis_url, decode_responses=True)
         self._supabase: Client = create_client(
-            url=os.getenv("SUPABASE_URL", "http://supabase-kong:8000"),
-            key=os.getenv("SUPABASE_SERVICE_KEY", ""),
+            url=settings.supabase_url,
+            key=settings.supabase_service_key,
         )
         self._active: dict[str, InteractionEvent] = {}
 
@@ -275,7 +273,6 @@ class Watcher:
 
     def _publish(self, event_type: str, data: dict):
         """Publica evento en Redis Pub/Sub para n8n y otros consumidores."""
-        import json
         try:
             self._redis.publish(
                 f"claude-brain:{event_type}",

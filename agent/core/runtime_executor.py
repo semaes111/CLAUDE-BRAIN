@@ -22,6 +22,7 @@ import os
 import re
 from pathlib import Path
 
+from agent.config import settings
 from agent.core.agentic_loop import Action, ActionType, Observation
 from agent.core.jupyter_kernel import JupyterKernelManager
 
@@ -56,16 +57,15 @@ class RuntimeExecutor:
 
     def __init__(
         self,
-        base_dir: str = "/workspaces",
+        base_dir: str | None = None,
         enable_browser: bool = True,
         runner=None,  # ClaudeMaxRunner, para DELEGATE
     ):
-        self.base_dir       = Path(base_dir)
+        self.base_dir       = Path(base_dir or settings.workdir)
         self.enable_browser = enable_browser
         self._runner        = runner
         self._browser       = None
         self._jupyter       = JupyterKernelManager()
-        # Session ID activa (se rellena por el loop en cada ejecución)
         self._current_session: str = "default"
 
     async def execute(self, action: Action, cwd: str = None) -> Observation:

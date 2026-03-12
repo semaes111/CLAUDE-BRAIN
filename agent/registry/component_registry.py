@@ -1,106 +1,33 @@
 """
-ComponentRegistry — Registro unificado de los 119 componentes de aitmpl.com
+ComponentRegistry — Registro unificado de agentes, skills y comandos.
 
 Tipos de componentes:
-  Agent   — Especialista con system prompt propio (36 agentes)
-              frontmatter: name, description, tools, model
-              body: system prompt completo del agente
-
-  Skill   — Conocimiento/guías inyectables (70 skills en SKILL.md)
-              frontmatter: name, description, allowed-tools
-              body: guías y ejemplos
-
-  Command — Comandos ejecutables con pasos bash inline (13 comandos)
-              frontmatter: description, argument-hint, allowed-tools
-              body: pasos con !`bash` inline
-
-Directorios:
-  /app/components/agents/     ← 36 agentes descargados por install-aitmpl.sh
-  /app/components/skills/     ← 70 skills
-  /app/components/commands/   ← 13 comandos
-  /app/skills/                ← skills propias del proyecto (nextjs-supabase-dev, etc.)
+  Agent   — Especialista con system prompt propio
+  Skill   — Conocimiento/guías inyectables (SKILL.md)
+  Command — Comandos ejecutables con pasos bash inline
 """
 
 import glob
 import os
-import re
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import yaml
 
-
-# ─────────────────────────────────────────────────────────
-# MODELOS DE DATOS
-# ─────────────────────────────────────────────────────────
-
-@dataclass
-class Agent:
-    name: str
-    description: str
-    system_prompt: str
-    tools: list[str] = field(default_factory=list)
-    model: str = "sonnet"
-    category: str = ""
-    source: str = "aitmpl"
+from agent.config import settings
+from agent.models import Agent, Command, Skill
 
 
-@dataclass
-class Skill:
-    name: str
-    description: str
-    path: Path
-    allowed_tools: list[str] = field(default_factory=list)
-    category: str = ""
-    source: str = "aitmpl"
-    _content: Optional[str] = field(default=None, repr=False)
+VALID_CLI_TOOLS = {
+    "Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep",
+    "WebSearch", "WebFetch", "TodoRead", "TodoWrite",
+}
 
-    @property
-    def content(self) -> str:
-        if self._content is None:
-            skill_file = self.path / "SKILL.md"
-            raw = skill_file.read_text(encoding="utf-8")
-            # Quitar frontmatter YAML
-            parts = raw.split("---", 2)
-            self._content = parts[2].strip() if len(parts) >= 3 else raw
-        return self._content
-
-    def to_prompt_block(self) -> str:
-        return f"<skill name='{self.name}'>\n{self.content}\n</skill>"
-
-
-@dataclass
-class Command:
-    name: str
-    description: str
-    body: str
-    argument_hint: str = ""
-    allowed_tools: list[str] = field(default_factory=list)
-    source: str = "aitmpl"
-
-    def render(self, arguments: str = "") -> str:
-        """Renderiza el comando sustituyendo $ARGUMENTS."""
-        return self.body.replace("$ARGUMENTS", arguments)
-
-
-# ─────────────────────────────────────────────────────────
-# REGISTRY PRINCIPAL
-# ─────────────────────────────────────────────────────────
 
 class ComponentRegistry:
     """
     Registro central de todos los componentes disponibles.
-    Soporta búsqueda semántica por descripción y selección por nombre.
+    Soporta búsqueda por nombre y generación de índice para prompts.
     """
-
-    COMPONENT_DIRS = {
-        "agents":   "/app/components/agents",
-        "skills":   "/app/components/skills",
-        "commands": "/app/components/commands",
-        # Skills propias del proyecto
-        "project_skills": "/app/skills",
-    }
 
     def __init__(self):
         self.agents:   dict[str, Agent]   = {}
@@ -108,8 +35,34 @@ class ComponentRegistry:
         self.commands: dict[str, Command] = {}
         self._scan_all()
 
-    def _parse_frontmatter(self, raw: str) -> tuple[dict, str]:
-        """Extrae frontmatter YAML y cuerpo del markdown."""
+    # ── Scanning ─────────────────────────────────────────
+
+    def _scan_all(self):
+        dirs = {
+            "agents":  settings.components_agents_dir,
+            "skills":  settings.components_skills_dir,
+            "commands": settings.components_commands_dir,
+            "project":  settings.project_skills_dir,
+        }
+        if os.path.exists(dirs["agents"]):
+            self._load_agents(dirs["agents"])
+        if os.path.exists(dirs["skills"]):
+            self._load_skills(dirs["skills"], source="aitmpl")
+        if os.path.exists(dirs["commands"]):
+            self._load_commands(dirs["commands"])
+        if os.path.exists(dirs["project"]):
+            self._load_skills(dirs["project"], source="project")
+
+    def reload(self):
+        self.agents.clear()
+        self.skills.clear()
+        self.commands.clear()
+        self._scan_all()
+
+    # ── Parsers ──────────────────────────────────────────
+
+    @staticmethod
+    def _parse_frontmatter(raw: str) -> tuple[dict, str]:
         parts = raw.split("---", 2)
         if len(parts) < 3:
             return {}, raw
@@ -119,8 +72,8 @@ class ComponentRegistry:
             fm = {}
         return fm, parts[2].strip()
 
-    def _parse_tools(self, tools_raw) -> list[str]:
-        """Normaliza tools: string CSV o lista."""
+    @staticmethod
+    def _parse_tools(tools_raw) -> list[str]:
         if not tools_raw:
             return []
         if isinstance(tools_raw, list):
@@ -136,7 +89,6 @@ class ComponentRegistry:
                 fm, body = self._parse_frontmatter(raw)
                 if not fm.get("name") or not body.strip():
                     continue
-                # Detectar categoría desde el path
                 rel = os.path.relpath(fp, base_dir)
                 category = rel.split(os.sep)[0] if os.sep in rel else "general"
 
@@ -172,6 +124,7 @@ class ComponentRegistry:
                     ),
                     category=category,
                     source=source,
+                    system_addition=str(fm.get("x-system-prompt-addition", "")),
                 )
             except Exception:
                 pass
@@ -195,36 +148,18 @@ class ComponentRegistry:
             except Exception:
                 pass
 
-    def _scan_all(self):
-        dirs = self.COMPONENT_DIRS
-        if os.path.exists(dirs["agents"]):
-            self._load_agents(dirs["agents"])
-        if os.path.exists(dirs["skills"]):
-            self._load_skills(dirs["skills"], source="aitmpl")
-        if os.path.exists(dirs["commands"]):
-            self._load_commands(dirs["commands"])
-        if os.path.exists(dirs["project_skills"]):
-            self._load_skills(dirs["project_skills"], source="project")
-
-    def reload(self):
-        self.agents.clear()
-        self.skills.clear()
-        self.commands.clear()
-        self._scan_all()
-
     # ── API pública ───────────────────────────────────────
 
-    def get_agent(self, name: str) -> Optional[Agent]:
+    def get_agent(self, name: str) -> Agent | None:
         return self.agents.get(name)
 
-    def get_skill(self, name: str) -> Optional[Skill]:
+    def get_skill(self, name: str) -> Skill | None:
         return self.skills.get(name)
 
-    def get_command(self, name: str) -> Optional[Command]:
+    def get_command(self, name: str) -> Command | None:
         return self.commands.get(name)
 
     def summary(self) -> dict:
-        """Resumen para health check / Telegram /status."""
         return {
             "agents":   len(self.agents),
             "skills":   len(self.skills),
@@ -233,18 +168,17 @@ class ComponentRegistry:
         }
 
     def catalog(self) -> dict:
-        """Catálogo completo estructurado por categoría."""
         agents_by_cat: dict[str, list] = {}
         for a in self.agents.values():
-            agents_by_cat.setdefault(a.category, []).append({
-                "name": a.name, "description": a.description
-            })
+            agents_by_cat.setdefault(a.category, []).append(
+                {"name": a.name, "description": a.description}
+            )
 
         skills_by_cat: dict[str, list] = {}
         for s in self.skills.values():
-            skills_by_cat.setdefault(s.category, []).append({
-                "name": s.name, "description": s.description, "source": s.source
-            })
+            skills_by_cat.setdefault(s.category, []).append(
+                {"name": s.name, "description": s.description, "source": s.source}
+            )
 
         return {
             "agents": agents_by_cat,
@@ -255,14 +189,9 @@ class ComponentRegistry:
             ],
         }
 
-    # ── Índice compacto para el system prompt ────────────
+    # ── Índice compacto para prompts ─────────────────────
 
     def get_index_prompt(self) -> str:
-        """
-        Índice ultra-compacto de todos los componentes.
-        Se inyecta en el system prompt para que el Router sepa qué hay disponible.
-        ~3 tokens por componente = ~360 tokens para los 119.
-        """
         lines = ["<available_components>"]
 
         if self.agents:
@@ -286,7 +215,7 @@ class ComponentRegistry:
         return "\n".join(lines)
 
     def _group_by_category(self, components: dict) -> dict:
-        groups = {}
+        groups: dict[str, list] = {}
         for item in components.values():
             groups.setdefault(item.category, []).append(item)
         return groups
@@ -296,52 +225,38 @@ class ComponentRegistry:
     def build_prompt(
         self,
         task: str,
-        agent_name: Optional[str] = None,
-        skill_names: Optional[list[str]] = None,
-        command_name: Optional[str] = None,
+        agent_name: str | None = None,
+        skill_names: list[str] | None = None,
+        command_name: str | None = None,
         command_args: str = "",
         memory_context: str = "",
     ) -> tuple[str, str, list[str]]:
         """
         Construye (system_prompt, user_prompt, tools) para ejecutar una tarea.
-
-        Returns:
-            system_prompt: system prompt del agente + instrucciones adicionales de skills
-            user_prompt:   tarea + contexto de memoria + skills + comando si aplica
-            tools:         herramientas combinadas de agente + skills
         """
         system_parts = ["Eres CLAUDE-BRAIN, un agente de desarrollo autónomo."]
-        user_parts = []
-        tools = set()
+        user_parts: list[str] = []
+        tools: set[str] = set()
 
-        # Agente especialista
         if agent_name and (agent := self.get_agent(agent_name)):
             system_parts.append(f"\n## Modo: {agent.name}\n{agent.system_prompt}")
             tools.update(agent.tools)
 
-        # Contexto de memoria
         if memory_context:
             user_parts.append(memory_context)
 
-        # Skills inyectadas
         for name in (skill_names or []):
             if skill := self.get_skill(name):
                 user_parts.append(skill.to_prompt_block())
                 tools.update(skill.allowed_tools)
 
-        # Comando a ejecutar
         if command_name and (cmd := self.get_command(command_name)):
             user_parts.append(f"<command name='{command_name}'>\n{cmd.render(command_args)}\n</command>")
             tools.update(cmd.allowed_tools)
 
         user_parts.append(f"<task>\n{task}\n</task>")
 
-        # Filtrar tools a las soportadas por el CLI
-        VALID_TOOLS = {
-            "Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep",
-            "WebSearch", "WebFetch", "TodoRead", "TodoWrite",
-        }
-        final_tools = [t for t in tools if t in VALID_TOOLS] or list(VALID_TOOLS)
+        final_tools = [t for t in tools if t in VALID_CLI_TOOLS] or list(VALID_CLI_TOOLS)
 
         return (
             "\n\n".join(system_parts),

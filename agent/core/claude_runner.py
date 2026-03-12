@@ -11,10 +11,11 @@ import asyncio
 import json
 import os
 import shutil
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator, Optional
 
+from agent.config import settings
 from agent.core.veracity import VERSION_COMPACT
 
 
@@ -43,10 +44,10 @@ class ClaudeMaxRunner:
         "WebSearch", "WebFetch", "TodoRead", "TodoWrite",
     ]
 
-    def __init__(self, workdir: str = "/workspaces"):
-        self.workdir = Path(workdir)
+    def __init__(self, workdir: str | None = None):
+        self.workdir = Path(workdir or settings.workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
-        self.timeout = int(os.getenv("AGENT_TIMEOUT_SECONDS", "300"))
+        self.timeout = settings.agent_timeout_seconds
         self._verify_claude_binary()
 
     def _verify_claude_binary(self):
@@ -57,7 +58,7 @@ class ClaudeMaxRunner:
                 "Autenticar: claude auth login"
             )
 
-    def _build_system(self, extra_system: Optional[str] = None) -> str:
+    def _build_system(self, extra_system: str | None = None) -> str:
         """
         Construye el system prompt COMPLETO para cada llamada al CLI.
 
@@ -82,11 +83,7 @@ class ClaudeMaxRunner:
             "HOME": os.environ.get("HOME", "/root"),
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin"),
             "CLAUDE_CODE_ENTRYPOINT": "cli",
-            # Directorio de credenciales OAuth (montado desde el host)
-            "CLAUDE_CONFIG_DIR": os.environ.get(
-                "CLAUDE_CONFIG_DIR",
-                os.path.join(os.environ.get("HOME", "/root"), ".claude")
-            ),
+            "CLAUDE_CONFIG_DIR": settings.claude_config_dir,
         }
         # CRÍTICO: NO incluir ANTHROPIC_API_KEY
         # Si existe en el entorno padre, NO la propagamos
@@ -95,11 +92,11 @@ class ClaudeMaxRunner:
     async def run(
         self,
         task: str,
-        cwd: Optional[str] = None,
+        cwd: str | None = None,
         output_format: str = "text",
-        allowed_tools: Optional[list] = None,
-        system: Optional[str] = None,
-        timeout: Optional[int] = None,
+        allowed_tools: list | None = None,
+        system: str | None = None,
+        timeout: int | None = None,
     ) -> RunResult:
         """
         Ejecuta una tarea con Claude usando Max subscription (sin API billing).
@@ -171,9 +168,9 @@ class ClaudeMaxRunner:
     async def run_with_tools(
         self,
         task: str,
-        tools: Optional[list] = None,
-        cwd: Optional[str] = None,
-        system: Optional[str] = None,
+        tools: list | None = None,
+        cwd: str | None = None,
+        system: str | None = None,
     ) -> RunResult:
         """
         Ejecuta tarea con acceso a herramientas built-in.
@@ -205,7 +202,7 @@ class ClaudeMaxRunner:
     async def stream(
         self,
         task: str,
-        cwd: Optional[str] = None,
+        cwd: str | None = None,
     ) -> AsyncIterator[str]:
         """
         Streaming de tokens para UI en tiempo real.

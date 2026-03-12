@@ -15,7 +15,6 @@ Patrones implementados:
 
 import asyncio
 import json
-from typing import Optional
 
 from agent.core.claude_runner import ClaudeMaxRunner, RunResult
 
@@ -34,9 +33,9 @@ class MultiAgentOrchestrator:
         self,
         agent_id: str,
         task: str,
-        tools: Optional[list] = None,
-        cwd: Optional[str] = None,
-        system: Optional[str] = None,
+        tools: list | None = None,
+        cwd: str | None = None,
+        system: str | None = None,
     ) -> tuple[str, RunResult]:
         """Ejecuta un subagente individual con control de concurrencia."""
         async with self.semaphore:

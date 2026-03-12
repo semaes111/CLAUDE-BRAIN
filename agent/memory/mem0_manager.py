@@ -18,15 +18,13 @@ LLM extracción: ClaudeMaxRunner subprocess ($0 extra, usa Max OAuth)
 import json
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 import httpx
 import redis
 
-# mem0 con configuración custom
 from mem0 import Memory
 
-# Guardia epistémica — filtra memorias antes de persistir
+from agent.config import settings
 from agent.core.veracity import should_persist_memory
 
 
@@ -36,7 +34,6 @@ def build_mem0_config() -> dict:
     Sin OpenAI, sin billing adicional.
     """
     return {
-        # Vector store: Supabase pgvector
         "vector_store": {
             "provider": "pgvector",
             "config": {
@@ -44,30 +41,24 @@ def build_mem0_config() -> dict:
                 "port":        5432,
                 "dbname":      "postgres",
                 "user":        "postgres",
-                "password":    os.getenv("POSTGRES_PASSWORD", ""),
+                "password":    settings.postgres_password,
                 "collection_name": "mem0_memories",
-                "embedding_model_dims": 768,  # nomic-embed-text-v1.5
+                "embedding_model_dims": 768,
             }
         },
-        # Embedder: nomic-embed-text local vía HTTP
         "embedder": {
             "provider": "huggingface",
             "config": {
                 "model": "nomic-ai/nomic-embed-text-v1.5",
-                # Apuntar al servidor TGI local
-                # mem0 usará la HuggingFace inference API format
             }
         },
-        # LLM: Anthropic (solo para extracción de memorias)
-        # Si no hay API key, mem0 usa extracción basada en reglas
         "llm": {
             "provider": "anthropic",
             "config": {
-                "model": "claude-haiku-4-5-20251001",  # Más barato para extracción
-                "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
+                "model": "claude-haiku-4-5-20251001",
+                "api_key": settings.anthropic_api_key,
             }
-        } if os.getenv("ANTHROPIC_API_KEY") else {
-            # Sin API key: extracción por reglas (menos precisa pero $0)
+        } if settings.anthropic_api_key else {
             "provider": "openai",
             "config": {
                 "model": "gpt-4o-mini",
@@ -86,12 +77,9 @@ class Mem0Manager:
     """
 
     def __init__(self):
-        self._redis = redis.from_url(
-            os.getenv("REDIS_URL", "redis://redis:6379"),
-            decode_responses=True
-        )
-        self._embed_url = os.getenv("EMBEDDING_URL", "http://embeddings:8080")
-        self._mem0: Optional[Memory] = None
+        self._redis = redis.from_url(settings.redis_url, decode_responses=True)
+        self._embed_url = settings.embedding_url
+        self._mem0: Memory | None = None
         self._mem0_ready = False
         self._init_mem0()
 
@@ -282,10 +270,7 @@ class Mem0Manager:
         """Búsqueda directa en agent_memories sin mem0."""
         from supabase import create_client
         try:
-            sb = create_client(
-                os.getenv("SUPABASE_URL", ""),
-                os.getenv("SUPABASE_SERVICE_KEY", "")
-            )
+            sb = create_client(settings.supabase_url, settings.supabase_service_key)
             embedding = await self._embed(query)
             result = sb.rpc("match_memories", {
                 "query_embedding": embedding,

@@ -19,11 +19,13 @@ construya apps de 0, haga debug iterativo — todo autónomo.
 import asyncio
 import hashlib
 import json
+import re
 import time
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AsyncGenerator, Optional
 
+from agent.config import settings
 from agent.core.claude_runner import ClaudeMaxRunner
 from agent.core.veracity import (
     VERSION_FULL,
@@ -121,8 +123,8 @@ class StuckDetector:
     - Error idéntico recibido 3+ veces
     """
 
-    def __init__(self, window: int = 6):
-        self.window = window  # cuántos steps mirar hacia atrás
+    def __init__(self, window: int | None = None):
+        self.window = window or settings.stuck_detector_window
 
     def is_stuck(self, steps: list[AgentStep]) -> tuple[bool, str]:
         if len(steps) < 3:
@@ -171,8 +173,8 @@ class ContextCondenser:
     Mantiene siempre los últimos N steps completos.
     """
 
-    MAX_CHARS  = 80_000   # ~20k tokens — umbral para condensar
-    KEEP_STEPS = 4        # últimos N steps siempre completos
+    MAX_CHARS  = settings.context_condenser_max_chars
+    KEEP_STEPS = settings.context_condenser_keep_steps
 
     def __init__(self, runner: ClaudeMaxRunner):
         self.runner = runner
@@ -317,7 +319,6 @@ class ActionParser:
     """
 
     def parse(self, text: str) -> list[Action]:
-        import re
         actions = []
 
         # Buscar bloques <action>...</action>
@@ -356,7 +357,7 @@ class ActionParser:
 
         return actions
 
-    def _build_action(self, data: dict) -> Optional[Action]:
+    def _build_action(self, data: dict) -> Action | None:
         try:
             action_type = ActionType(data.get("type", "think"))
             thought = str(data.pop("thought", ""))

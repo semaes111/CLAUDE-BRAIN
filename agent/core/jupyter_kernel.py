@@ -38,9 +38,10 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
 
 import httpx
+
+from agent.config import settings
 
 # ─────────────────────────────────────────────────────────
 # MODELOS
@@ -51,7 +52,7 @@ class CellResult:
     """Output completo de ejecutar una celda IPython."""
     text:        str              # stdout + stderr + repr del resultado
     images:      list[str]        # lista de base64 PNG (matplotlib, etc.)
-    error:       Optional[str]    # traceback si hubo excepción
+    error:       str | None    # traceback si hubo excepción
     exec_count:  int              # número de ejecución (In [N])
     success:     bool
     duration_ms: int = 0
@@ -95,11 +96,10 @@ class JupyterKernelManager:
     https://jupyter-client.readthedocs.io/en/latest/messaging.html
     """
 
-    JUPYTER_URL = os.getenv("JUPYTER_URL", "http://jupyter:8888")
-    JUPYTER_TOKEN = os.getenv("JUPYTER_TOKEN", "claude-brain-jupyter-token")
+    JUPYTER_URL = settings.jupyter_url
+    JUPYTER_TOKEN = settings.jupyter_token
 
-    # Tiempo máximo de inactividad antes de matar el kernel (30 min)
-    KERNEL_TTL = 1800
+    KERNEL_TTL = settings.kernel_ttl_seconds
 
     # Setup code que se ejecuta al crear cada kernel
     KERNEL_INIT_CODE = '''
@@ -153,7 +153,7 @@ print(f"✅ Kernel inicializado | Python {sys.version.split()[0]} | numpy {np.__
             "Content-Type": "application/json",
         }
         # Task de limpieza de kernels inactivos
-        self._cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_task: asyncio.Task | None = None
 
     async def start(self):
         """Inicia el manager y la tarea de limpieza."""
@@ -368,7 +368,7 @@ print(f"✅ Kernel inicializado | Python {sys.version.split()[0]} | numpy {np.__
 
         text_parts:  list[str] = []
         images:      list[str] = []
-        error_text:  Optional[str] = None
+        error_text:  str | None = None
 
         try:
             async with websockets.connect(
