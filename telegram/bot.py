@@ -345,22 +345,23 @@ def main():
     if not BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN no configurado en .env")
 
-    print("🤖 CLAUDE-BRAIN Bot — Lenguaje natural puro")
+    print("🤖 CLAUDE-BRAIN Bot — Lenguaje natural puro + Modo Agente")
     print(f"   API: {AGENT_API}")
     print(f"   IDs: {ALLOWED_IDS or 'todos'}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Solo comandos utilitarios — todo lo demás es lenguaje natural
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("debug",  cmd_debug))
     app.add_handler(CommandHandler("exec",   cmd_exec))
     app.add_handler(CommandHandler("mem",    cmd_mem))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("run",    cmd_run))
+    app.add_handler(CommandHandler("issue",  cmd_issue))
 
-    # Todo texto → router automático
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Todo texto → router automático (o agentic si dice "modo agente:")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_smart))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     print("✅ Listo")
@@ -369,3 +370,174 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ─────────────────────────────────────────────
+# MODO AGENTE — Agentic loop multi-turno
+# Escribe "modo agente: <tarea>" o usa /run
+# ─────────────────────────────────────────────
+
+async def handle_agentic_task(update: Update, task: str, session_id: str, max_iter: int = 25):
+    """Ejecuta el AgenticLoop y hace streaming de cada step al usuario."""
+    msg = await update.message.reply_text(
+        "🤖 *Modo Agente iniciado*\n_Iniciando loop autónomo..._",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    steps_text = ""
+    last_edit_len = 0
+
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            async with client.stream(
+                "GET",
+                f"{AGENT_API}/v1/agent/run/stream",
+                params={"task": task, "session_id": session_id, "max_iterations": max_iter}
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        event = json.loads(line[6:])
+                    except Exception:
+                        continue
+
+                    if event["type"] == "step":
+                        i       = event["iteration"]
+                        act     = event["action_type"]
+                        thought = event.get("thought", "")[:80]
+                        ok      = "✅" if event.get("obs_ok") else "❌"
+                        obs     = event.get("obs_preview", "")[:120]
+
+                        ICONS = {
+                            "bash": "💻", "read": "📖", "write": "✍️",
+                            "edit": "✏️", "browse": "🌐", "think": "💭",
+                            "delegate": "🤝", "finish": "🏁", "reject": "🚫",
+                        }
+                        icon = ICONS.get(act, "⚡")
+                        steps_text += f"{icon} *[{i}] {act}*: _{thought}_\n{ok} `{obs}`\n\n"
+
+                        # Editar el mensaje cada 3 steps para no saturar
+                        if i % 3 == 0 or len(steps_text) - last_edit_len > 500:
+                            display = steps_text[-3000:] if len(steps_text) > 3000 else steps_text
+                            try:
+                                await msg.edit_text(
+                                    f"🤖 *Agente en progreso* (iter {i})\n\n{display}",
+                                    parse_mode=ParseMode.MARKDOWN
+                                )
+                                last_edit_len = len(steps_text)
+                            except Exception:
+                                pass
+
+                    elif event["type"] == "finish":
+                        success = event.get("success", False)
+                        message = event.get("message", "")
+                        iters   = event.get("iterations", 0)
+                        stuck   = event.get("stuck", False)
+
+                        icon = "✅" if success else ("🔄" if stuck else "❌")
+                        summary = (
+                            f"{icon} *{'Completado' if success else 'Detenido'}*"
+                            f" ({iters} iteraciones{'— loop detectado' if stuck else ''})\n\n"
+                            f"{message}"
+                        )
+                        await msg.delete()
+                        await send_long(update, summary, parse_mode=ParseMode.MARKDOWN)
+                        return
+
+        await msg.edit_text("⚠️ Stream terminó sin evento finish")
+
+    except Exception as e:
+        try:
+            await msg.edit_text(f"❌ Error en modo agente: {e}")
+        except Exception:
+            await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/run <tarea> — fuerza el modo agente multi-turno"""
+    if not authorized(update): return await reject(update)
+    task = " ".join(ctx.args) if ctx.args else ""
+    if not task:
+        await update.message.reply_text(
+            "Uso: `/run <tarea compleja>`\n\n"
+            "También puedes escribir: `modo agente: <tarea>`\n\n"
+            "El agente ejecuta comandos, edita archivos, navega la web — todo autónomo.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    await handle_agentic_task(update, task, str(update.effective_user.id))
+
+
+async def cmd_issue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/issue owner/repo 123 — resuelve un GitHub issue"""
+    if not authorized(update): return await reject(update)
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Uso: `/issue owner/repo 123`\nEjemplo: `/issue microsoft/vscode 12345`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    repo      = args[0]
+    issue_num = int(args[1])
+    msg       = await update.message.reply_text(f"🔍 Analizando issue #{issue_num} en `{repo}`...", parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            resp = await client.post(f"{AGENT_API}/v1/git/solve-issue", json={
+                "repo": repo, "issue_num": issue_num,
+                "session_id": str(update.effective_user.id)
+            })
+            data = resp.json()
+
+        icon = "✅" if data.get("success") else "❌"
+        text = (
+            f"{icon} *Issue #{issue_num}*\n\n"
+            f"{data.get('message', '')}\n\n"
+            f"Iteraciones: `{data.get('iterations', 0)}`"
+        )
+        if "commit" in data:
+            c = data["commit"]
+            text += f"\n\n{'✅ Commit OK' if c['ok'] else '❌ Commit falló'}: `{c.get('output','')[:200]}`"
+
+        await msg.delete()
+        await send_long(update, text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}")
+
+
+
+# ─────────────────────────────────────────────
+# DISPATCHER — Detecta si el usuario quiere modo agente
+# ─────────────────────────────────────────────
+
+AGENTIC_TRIGGERS = [
+    "modo agente:", "agent mode:", "autonomous:", "autónomo:",
+    "ejecuta:", "crea un proyecto", "construye una app",
+    "resuelve el issue", "implementa desde cero",
+]
+
+async def handle_message_smart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Dispatcher inteligente:
+    - Si el mensaje empieza con trigger de modo agente → AgenticLoop (multi-turno)
+    - Si no → SmartRouter + single-shot (rápido)
+    """
+    if not authorized(update): return await reject(update)
+
+    text    = update.message.text.strip()
+    session = str(update.effective_user.id)
+
+    # Detectar modo agente
+    text_lower = text.lower()
+    for trigger in AGENTIC_TRIGGERS:
+        if text_lower.startswith(trigger):
+            task = text[len(trigger):].strip()
+            if task:
+                await handle_agentic_task(update, task, session)
+                return
+            break
+
+    # Modo normal con router automático
+    await handle_message(update, ctx)

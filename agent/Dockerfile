@@ -16,7 +16,7 @@ WORKDIR /app
 # Dependencias Python (incluye mem0ai)
 # ─────────────────────────────────────────────
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && playwright install chromium --with-deps 2>/dev/null || true
 
 # ─────────────────────────────────────────────
 # Código del agente

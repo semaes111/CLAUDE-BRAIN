@@ -210,3 +210,148 @@ async def status():
             "watcher": watcher.get_metrics(),
         }
     }
+
+# ─────────────────────────────────────────────────────────
+# AGENTIC LOOP ENDPOINTS
+# ─────────────────────────────────────────────────────────
+
+from agent.core.agentic_loop import AgenticLoop
+from agent.core.runtime_executor import RuntimeExecutor
+
+_runtime = RuntimeExecutor(
+    base_dir="/workspaces",
+    enable_browser=True,
+    runner=runner,
+)
+
+class AgentRunRequest(BaseModel):
+    task:           str
+    session_id:     str        = "default"
+    max_iterations: int        = Field(default=30, ge=1, le=50)
+    cwd:            str        = "/workspaces"
+    confirm_mode:   bool       = False
+    agent_name:     Optional[str] = None  # fuerza un agente especialista
+
+@app.post("/v1/agent/run")
+async def agent_run(req: AgentRunRequest):
+    """
+    Ejecuta el AgenticLoop completo (multi-turno).
+    El agente puede ejecutar bash, leer/escribir archivos, navegar web.
+    Retorna cuando llega a finish/reject o max_iterations.
+    """
+    # Obtener system prompt de agente especialista si se especifica
+    extra_system = ""
+    if req.agent_name and (agent := registry.get_agent(req.agent_name)):
+        extra_system = agent.system_prompt
+
+    loop = AgenticLoop(
+        runner=runner,
+        runtime=_runtime,
+        max_iterations=req.max_iterations,
+        confirm_mode=req.confirm_mode,
+    )
+
+    result = await loop.run(
+        task=req.task,
+        session_id=req.session_id,
+        cwd=req.cwd,
+        extra_system=extra_system,
+    )
+
+    return {
+        "success":    result.success,
+        "message":    result.message,
+        "iterations": result.iterations,
+        "stuck":      result.stuck,
+        "steps": [
+            {
+                "i":          s.iteration,
+                "action":     s.action.type.value,
+                "thought":    s.action.thought[:200],
+                "payload":    str(s.action.payload)[:300],
+                "obs_ok":     s.observation.success,
+                "obs":        s.observation.content[:400],
+            }
+            for s in result.steps
+        ],
+    }
+
+@app.get("/v1/agent/run/stream")
+async def agent_run_stream(
+    task:           str,
+    session_id:     str = "default",
+    max_iterations: int = 30,
+    cwd:            str = "/workspaces",
+):
+    """Streaming del AgenticLoop — SSE con cada step en tiempo real."""
+    loop = AgenticLoop(
+        runner=runner,
+        runtime=_runtime,
+        max_iterations=max_iterations,
+    )
+
+    async def generate():
+        async for event in loop.stream(task, session_id, cwd):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# GIT WORKFLOW ENDPOINTS
+# ─────────────────────────────────────────────────────────
+
+from agent.core.git_workflow import GitWorkflow
+
+_git = GitWorkflow()
+
+class IssueRequest(BaseModel):
+    repo:       str  # owner/repo
+    issue_num:  int
+    session_id: str = "default"
+
+@app.post("/v1/git/solve-issue")
+async def solve_github_issue(req: IssueRequest):
+    """
+    Resuelve un GitHub Issue de forma autónoma.
+    Clona el repo, analiza el issue, aplica cambios, hace commit.
+    """
+    # Clonar
+    ctx = await _git.clone_repo(f"https://github.com/{req.repo}.git")
+    branch_name = f"fix/issue-{req.issue_num}"
+    await _git.create_branch(branch_name)
+
+    # Construir contexto
+    issue_context = await _git.build_issue_context(req.repo, req.issue_num)
+
+    # Ejecutar loop
+    loop = AgenticLoop(
+        runner=runner, runtime=_runtime, max_iterations=25,
+    )
+    result = await loop.run(
+        task=issue_context,
+        session_id=req.session_id,
+        cwd=str(ctx.work_dir),
+    )
+
+    response = {"success": result.success, "message": result.message, "iterations": result.iterations}
+
+    # Si terminó con éxito, hacer commit
+    if result.success:
+        ok, out = await _git.commit_changes(f"fix: resolve issue #{req.issue_num}\n\n{result.message[:500]}")
+        response["commit"] = {"ok": ok, "output": out}
+
+    return response
+
+@app.get("/v1/git/diff")
+async def git_diff():
+    """Diff actual del workspace."""
+    return {"diff": await _git.get_diff()}
+
+@app.get("/v1/git/status")
+async def git_status():
+    return {"status": await _git.get_status()}
