@@ -26,6 +26,9 @@ import redis
 # mem0 con configuración custom
 from mem0 import Memory
 
+# Guardia epistémica — filtra memorias antes de persistir
+from agent.core.veracity import should_persist_memory
+
 
 def build_mem0_config() -> dict:
     """
@@ -136,21 +139,56 @@ class Mem0Manager:
         messages: list[dict],
         user_id: str,
         session_id: str,
+        session_success: bool = True,  # resultado del AgenticLoop o chat
     ) -> list[dict]:
         """
         Extrae y guarda memorias importantes de una conversación.
+        Aplica MemoryGuard (veracity.py) antes de persistir:
+          - Descarta memorias con markers de incertidumbre
+          - Descarta datos técnicos específicos de sesiones fallidas
+          - Descarta memorias demasiado vagas (< 20 chars)
+
         mem0 detecta: preferencias, hechos, procedimientos, errores pasados.
         Deduplica automáticamente.
         """
         if not self._mem0_ready:
             return []
         try:
+            # mem0 extrae las memorias candidatas del historial
             result = self._mem0.add(
                 messages=messages,
                 user_id=user_id,
                 metadata={"session_id": session_id}
             )
-            return result.get("results", [])
+            raw_memories = result.get("results", [])
+
+            # ── MemoryGuard: filtrar antes de que queden persistidas ──
+            # NOTA: mem0 ya las guardó en este punto si no las podemos interceptar
+            # antes del add(). El guard actúa borrando las que no pasan el filtro.
+            filtered_out = []
+            for mem in raw_memories:
+                mem_text = mem.get("memory", "")
+                should_keep, reason = should_persist_memory(mem_text, session_success)
+                if not should_keep:
+                    # Borrar inmediatamente la memoria que no pasó el filtro
+                    mem_id = mem.get("id")
+                    if mem_id and self._mem0_ready:
+                        try:
+                            self._mem0.delete(memory_id=mem_id)
+                            filtered_out.append((mem_text[:60], reason))
+                        except Exception:
+                            pass
+
+            if filtered_out:
+                print(f"[MemoryGuard] {len(filtered_out)} memorias eliminadas:")
+                for text, reason in filtered_out:
+                    print(f"  ✗ '{text}' → {reason}")
+
+            # Retornar solo las que pasaron el filtro
+            passed = [m for m in raw_memories if m.get("id") not in
+                      {mem.get("id") for mem, _ in [(m, r) for m, r in filtered_out]}]
+            return passed
+
         except Exception as e:
             print(f"[Mem0] Error en remember: {e}")
             return []

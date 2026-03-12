@@ -31,6 +31,8 @@ from typing import Optional
 import redis
 from supabase import create_client, Client
 
+from agent.core.veracity import compute_degradation_score
+
 
 # ─────────────────────────────────────────────────────────
 # EVENTO DE INTERACCIÓN
@@ -54,6 +56,9 @@ class InteractionEvent:
     tokens_estimated: int = 0       # Estimación: chars/4
     started_at: float = field(default_factory=time.time)
     ended_at: float = 0.0
+    # Métricas epistémicas (CAPA 7)
+    degradation_score: float = 0.0   # 0.0-1.0 (>0.5 = alerta)
+    degradation_triggers: list = field(default_factory=list)  # patrones detectados
 
     def finalize(self, response: str, success: bool, error: str = ""):
         self.ended_at = time.time()
@@ -62,6 +67,8 @@ class InteractionEvent:
         self.tokens_estimated = len(response) // 4
         self.success = success
         self.error = error[:500] if error else None
+        # Calcular degradation score del response
+        self.degradation_score, self.degradation_triggers = compute_degradation_score(response)
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +86,8 @@ class InteractionEvent:
             "error": self.error,
             "latency_ms": self.latency_ms,
             "tokens_estimated": self.tokens_estimated,
+            "degradation_score": self.degradation_score,
+            "degradation_triggers": self.degradation_triggers,
         }
 
 
@@ -228,6 +237,28 @@ class Watcher:
             if event.agent_used:
                 pipe.hincrby(f"watcher:agent_usage", event.agent_used, 1)
 
+            # ── Métricas epistémicas (DegradationDetector) ──────
+            if event.degradation_score > 0:
+                # Acumular score de degradación (media móvil)
+                pipe.lpush("watcher:degradation_scores", round(event.degradation_score, 3))
+                pipe.ltrim("watcher:degradation_scores", 0, 99)
+                # Si score severo → loguear alerta
+                if event.degradation_score > 0.5:
+                    pipe.hincrby(self.METRICS_KEY, "degradation_alerts", 1)
+                    pipe.lpush("watcher:degradation_alerts", (
+                        f"{event.session_id}|{event.interaction_id[:8]}|"
+                        f"{round(event.degradation_score, 2)}|"
+                        f"{','.join(event.degradation_triggers[:2])}"
+                    ))
+                    pipe.ltrim("watcher:degradation_alerts", 0, 49)
+                    # Publicar evento de alerta en Pub/Sub → Telegram bot puede recibirlo
+                    self._publish("epistemic.alert", {
+                        "session_id": event.session_id,
+                        "degradation_score": event.degradation_score,
+                        "triggers": event.degradation_triggers,
+                        "response_preview": event.response_preview[:200],
+                    })
+
             # Rate por ventana de 1 minuto (para detectar si vamos a alcanzar rate limit)
             window = int(time.time() // 60)
             rate_key = self.RATE_KEY.format(window=window)
@@ -289,6 +320,15 @@ class Watcher:
                 "tokens_estimated_total": tokens,
                 "active_requests": len(self._active),
                 "top_agents": dict(top_agents),
+                # Métricas epistémicas
+                "degradation": {
+                    "total_alerts": int(self._redis.hget(self.METRICS_KEY, "degradation_alerts") or 0),
+                    "recent_scores": [
+                        float(s) for s in
+                        (self._redis.lrange("watcher:degradation_scores", 0, 9) or [])
+                    ],
+                    "recent_alerts": self._redis.lrange("watcher:degradation_alerts", 0, 4) or [],
+                },
             }
         except Exception as e:
             return {"error": str(e)}

@@ -25,6 +25,13 @@ from enum import Enum
 from typing import AsyncGenerator, Optional
 
 from agent.core.claude_runner import ClaudeMaxRunner
+from agent.core.veracity import (
+    VERSION_FULL,
+    CONDENSER_SYSTEM,
+    RECALIBRATE_EVERY,
+    RECALIBRATION_MESSAGE,
+    compute_degradation_score,
+)
 
 
 # ─────────────────────────────────────────────────────────
@@ -94,6 +101,7 @@ class LoopResult:
     iterations: int
     stuck:      bool = False
     outputs:    dict = field(default_factory=dict)
+    degradation_log: list[dict] = field(default_factory=list)  # historial de alertas epistémicas
 
 
 # ─────────────────────────────────────────────────────────
@@ -179,28 +187,39 @@ class ContextCondenser:
 
     async def condense(self, steps: list[AgentStep], task: str) -> str:
         """
-        Resume los steps antiguos en un bloque de texto compacto.
-        Retorna el resumen para usar como contexto del agente.
+        Resume los steps antiguos en un bloque de texto estructurado.
+
+        Usa CONDENSER_SYSTEM (de veracity.py) que obliga al LLM a:
+        - Preservar exit codes y mensajes de error LITERALES
+        - Separar [HECHOS VERIFICADOS] de [INTENTOS FALLIDOS]
+        - Nunca suavizar errores ni inferir éxitos no observados
         """
         old_steps = steps[:-self.KEEP_STEPS] if len(steps) > self.KEEP_STEPS else steps
 
-        history_text = "\n".join(
-            f"Step {s.iteration}: [{s.action.type}] {json.dumps(s.action.payload)[:200]}"
-            f" → {'OK' if s.observation.success else 'ERROR'}: {s.observation.content[:200]}"
-            for s in old_steps
-        )
+        # Formatear historial con datos DUROS: tipo, payload, resultado, exit code
+        history_lines = []
+        for s in old_steps:
+            result_flag  = "SUCCESS" if s.observation.success else "FAILURE"
+            meta         = s.observation.metadata
+            exit_info    = f" [exit:{meta.get('exit_code', '?')}]" if "exit_code" in meta else ""
+            content_clip = s.observation.content[:300].replace("\n", " ")
+            history_lines.append(
+                f"Step {s.iteration} [{s.action.type.value}]{exit_info}: "
+                f"{json.dumps(s.action.payload)[:150]} "
+                f"→ {result_flag}: {content_clip}"
+            )
+
+        history_text = "\n".join(history_lines)
 
         prompt = (
-            f"Tarea original: {task[:500]}\n\n"
-            f"Historial a resumir:\n{history_text}\n\n"
-            "Resume en máximo 500 palabras qué se ha hecho, qué ha funcionado, "
-            "qué ha fallado, y cuál es el estado actual. "
-            "Sé concreto con nombres de archivos, comandos y errores."
+            f"Tarea: {task[:400]}\n\n"
+            f"Historial de steps ({len(old_steps)} steps):\n{history_text}\n\n"
+            "Genera el resumen estructurado siguiendo exactamente el formato del sistema."
         )
 
         result = await self.runner.run(
             task=prompt,
-            system="Eres un resumidor técnico. Responde solo con el resumen, sin preámbulo.",
+            system=CONDENSER_SYSTEM,
             timeout=60,
         )
         return result.output
@@ -348,6 +367,133 @@ class ActionParser:
 
 
 # ─────────────────────────────────────────────────────────
+# ACTION VALIDATOR
+# Guardia post-parse que rechaza Actions semánticamente inválidas.
+# Previene que el modelo inyecte acciones "plausibles pero inventadas".
+# ─────────────────────────────────────────────────────────
+
+class ActionValidator:
+    """
+    Valida la coherencia semántica de una Action después del parsing.
+
+    El ActionParser garantiza validez JSON y campos mínimos.
+    El ActionValidator garantiza que los VALORES tienen sentido:
+      - BASH: cmd no puede ser vacío, comentario puro o placeholder
+      - READ/WRITE/EDIT: path debe tener extensión o ser directorio válido
+      - FINISH: message debe referenciar evidencia concreta (>80 chars)
+      - REJECT: reason debe ser específica (>30 chars)
+      - IPYTHON: code no puede ser solo un comentario
+    """
+
+    # Placeholders típicos del modelo cuando no sabe qué poner
+    PLACEHOLDER_PATTERNS = [
+        "your_", "example", "placeholder", "todo", "fixme",
+        "<cmd>", "<path>", "<code>", "...",
+        "comando_aquí", "ruta_aquí", "código_aquí",
+    ]
+
+    def validate(self, action: Action) -> tuple[bool, str]:
+        """
+        Valida la Action. Retorna (is_valid, reason_if_invalid).
+        Si is_valid=False, el loop debe reemplazarla con un THINK de recalibración.
+        """
+        t = action.type
+        p = action.payload
+
+        match t:
+            case ActionType.BASH:
+                return self._validate_bash(p)
+            case ActionType.READ:
+                return self._validate_path_action(p, "READ")
+            case ActionType.WRITE:
+                return self._validate_write(p)
+            case ActionType.EDIT:
+                return self._validate_edit(p)
+            case ActionType.IPYTHON:
+                return self._validate_ipython(p)
+            case ActionType.FINISH:
+                return self._validate_finish(p)
+            case ActionType.REJECT:
+                return self._validate_reject(p)
+            case _:
+                return True, ""  # THINK, BROWSE, DELEGATE: sin restricciones estrictas
+
+    def _validate_bash(self, p: dict) -> tuple[bool, str]:
+        cmd = str(p.get("cmd", "")).strip()
+        if not cmd:
+            return False, "BASH con cmd vacío"
+        if cmd.startswith("#"):
+            return False, "BASH con solo un comentario como cmd"
+        if len(cmd) < 2:
+            return False, f"BASH con cmd demasiado corto: '{cmd}'"
+        for ph in self.PLACEHOLDER_PATTERNS:
+            if ph.lower() in cmd.lower():
+                return False, f"BASH con placeholder detectado: '{ph}' en '{cmd[:60]}'"
+        return True, ""
+
+    def _validate_path_action(self, p: dict, action_name: str) -> tuple[bool, str]:
+        path = str(p.get("path", "")).strip()
+        if not path:
+            return False, f"{action_name} con path vacío"
+        for ph in self.PLACEHOLDER_PATTERNS:
+            if ph.lower() in path.lower():
+                return False, f"{action_name} con placeholder en path: '{path[:60]}'"
+        return True, ""
+
+    def _validate_write(self, p: dict) -> tuple[bool, str]:
+        ok, reason = self._validate_path_action(p, "WRITE")
+        if not ok:
+            return ok, reason
+        content = str(p.get("content", ""))
+        if not content.strip():
+            return False, "WRITE con content vacío"
+        return True, ""
+
+    def _validate_edit(self, p: dict) -> tuple[bool, str]:
+        ok, reason = self._validate_path_action(p, "EDIT")
+        if not ok:
+            return ok, reason
+        old_str = str(p.get("old", "")).strip()
+        new_str = p.get("new", None)
+        if not old_str:
+            return False, "EDIT con 'old' vacío — ¿qué texto hay que reemplazar?"
+        if new_str is None:
+            return False, "EDIT sin campo 'new' — especifica el texto de reemplazo"
+        return True, ""
+
+    def _validate_ipython(self, p: dict) -> tuple[bool, str]:
+        code = str(p.get("code", "")).strip()
+        if not code:
+            return False, "IPYTHON con code vacío"
+        # Solo comentarios
+        non_comment = [l for l in code.splitlines() if l.strip() and not l.strip().startswith("#")]
+        if not non_comment:
+            return False, "IPYTHON con código solo compuesto de comentarios"
+        for ph in self.PLACEHOLDER_PATTERNS:
+            if ph.lower() in code.lower():
+                return False, f"IPYTHON con placeholder detectado: '{ph}'"
+        return True, ""
+
+    def _validate_finish(self, p: dict) -> tuple[bool, str]:
+        msg = str(p.get("message", "")).strip()
+        if len(msg) < 80:
+            return False, (
+                f"FINISH con message demasiado vago ({len(msg)} chars). "
+                "El mensaje de finish debe referenciar evidencia concreta de los steps completados."
+            )
+        vague_finishes = ["completado", "listo", "done", "finished", "todo ok", "all done"]
+        if msg.lower().strip() in vague_finishes:
+            return False, f"FINISH vago: '{msg}'. Describe qué hiciste exactamente."
+        return True, ""
+
+    def _validate_reject(self, p: dict) -> tuple[bool, str]:
+        reason = str(p.get("reason", "")).strip()
+        if len(reason) < 30:
+            return False, "REJECT con reason demasiado corta. Explica específicamente por qué no puedes completar la tarea."
+        return True, ""
+
+
+# ─────────────────────────────────────────────────────────
 # AGENTIC LOOP — El motor principal
 # ─────────────────────────────────────────────────────────
 
@@ -419,13 +565,30 @@ reject — tarea imposible:
 {"type": "reject", "reason": "No puedo hacer X porque...", "thought": "fuera de mis capacidades"}
 </action>
 
-REGLAS:
+REGLAS OPERATIVAS:
 - Siempre incluye "thought" explicando tu razonamiento
 - Una sola acción por respuesta
 - Si un comando falla, analiza el error y prueba algo diferente
 - Cuando termines completamente, usa finish
 - Si llevas 3 intentos fallidos en lo mismo, cambia de estrategia
 """
+
+    def _build_full_system(self, extra_system: str = "") -> str:
+        """
+        Combina SYSTEM_PROMPT + VERSION_FULL + extra_system del especialista.
+
+        Orden deliberado:
+          1. SYSTEM_PROMPT  → qué hacer (acciones, formato, reglas operativas)
+          2. VERSION_FULL   → cómo pensar (honestidad, calibración, anti-degradación)
+          3. extra_system   → contexto del agente especialista (si lo hay)
+
+        VERSION_FULL va DESPUÉS del SYSTEM_PROMPT para que las normas
+        epistémicas sean lo último que el modelo lee antes de actuar.
+        """
+        parts = [self.SYSTEM_PROMPT.strip(), VERSION_FULL.strip()]
+        if extra_system and extra_system.strip():
+            parts.append(f"## Modo especialista:\n{extra_system.strip()}")
+        return "\n\n---\n\n".join(parts)
 
     def __init__(
         self,
@@ -441,6 +604,7 @@ REGLAS:
         self.stuck_detector = StuckDetector()
         self.condenser      = ContextCondenser(runner)
         self.parser         = ActionParser()
+        self.validator      = ActionValidator()  # guardia post-parse
 
     async def run(
         self,
@@ -463,15 +627,22 @@ REGLAS:
         steps:    list[AgentStep] = []
         tracker = TaskTracker()
         history: list[dict] = []  # Historial multi-turno para Claude
+        degradation_log: list[dict] = []  # Registro de scores de degradación
 
-        system = self.SYSTEM_PROMPT
-        if extra_system:
-            system += f"\n\n## Modo especialista:\n{extra_system}"
+        # System prompt completo: operativo + epistémico + especialista
+        system = self._build_full_system(extra_system)
 
         # Primer mensaje: la tarea
         history.append({"role": "user", "content": task})
 
         for iteration in range(1, self.max_iterations + 1):
+
+            # ── Recalibración epistémica periódica ─────────────
+            # Cada RECALIBRATE_EVERY iteraciones, inyectar recordatorio
+            # de normas en el historial para contrarrestar la degradación
+            if iteration > 1 and (iteration - 1) % RECALIBRATE_EVERY == 0:
+                recal_msg = RECALIBRATION_MESSAGE.format(iteration=iteration)
+                history.append({"role": "user", "content": recal_msg})
 
             # ── Condensar si el context es demasiado largo ──────
             if self.condenser.needs_condensation(steps, task):
@@ -501,9 +672,62 @@ REGLAS:
                     iterations=iteration,
                 )
 
+            # ── Degradation detector ────────────────────────────
+            # Analiza el output del agente buscando patrones de degradación
+            deg_score, deg_triggers = compute_degradation_score(result.output)
+            if deg_triggers:
+                degradation_log.append({
+                    "iteration": iteration,
+                    "score": deg_score,
+                    "triggers": deg_triggers,
+                })
+                # Si degradación severa (>0.5), inyectar alerta en historial
+                if deg_score > 0.5:
+                    history.append({"role": "user", "content": (
+                        f"⚠️ ALERTA EPISTÉMICA (iter {iteration}): "
+                        f"Se detectaron patrones de degradación en tu respuesta anterior: "
+                        f"{', '.join(deg_triggers[:3])}.\n"
+                        "DETENTE. Verifica que tu próxima acción está basada en "
+                        "Observations REALES, no en suposiciones o en tu historial.\n"
+                        "Si hay incertidumbre → usa THINK para declararla primero."
+                    )})
+
             # ── Parsear acción ──────────────────────────────────
             actions = self.parser.parse(result.output)
             action = actions[0]  # Una acción por turno
+
+            # ── Validar acción (guardia semántica) ──────────────
+            # Detecta acciones con campos vacíos, placeholders o finishes vagos.
+            # Si falla → reemplazar con THINK de recalibración en lugar de ejecutar.
+            is_valid, invalid_reason = self.validator.validate(action)
+            if not is_valid:
+                action = Action(
+                    type=ActionType.THINK,
+                    payload={"thought": f"[ActionValidator] acción inválida rechazada: {invalid_reason}"},
+                    thought=f"Recalibrando: {invalid_reason}",
+                )
+                # Inyectar feedback en el historial para que el agente corrija
+                history.append({"role": "assistant", "content": result.output})
+                history.append({"role": "user", "content": (
+                    f"⚠️ ACCIÓN INVÁLIDA RECHAZADA: {invalid_reason}\n"
+                    "La acción que generaste tiene un problema de calidad epistémica.\n"
+                    "Por favor:\n"
+                    "1. Usa la acción THINK para recalibrar\n"
+                    "2. Luego genera una acción concreta y verificable\n"
+                    "3. Asegúrate de que todos los campos tienen valores reales, no placeholders"
+                )})
+                steps.append(AgentStep(
+                    iteration=iteration,
+                    action=action,
+                    observation=Observation(
+                        action_type=ActionType.THINK,
+                        content=f"Acción rechazada por ActionValidator: {invalid_reason}",
+                        success=False,
+                    )
+                ))
+                if on_step:
+                    await on_step(steps[-1])
+                continue  # Ir a la siguiente iteración sin ejecutar
 
             # Añadir respuesta del agente al historial
             history.append({"role": "assistant", "content": result.output})
@@ -516,6 +740,7 @@ REGLAS:
                     steps=steps,
                     iterations=iteration,
                     outputs=action.payload.get("outputs", {}),
+                    degradation_log=degradation_log,
                 )
 
             if action.type == ActionType.REJECT:
@@ -524,6 +749,7 @@ REGLAS:
                     message=f"Rechazado: {action.payload.get('reason', '')}",
                     steps=steps,
                     iterations=iteration,
+                    degradation_log=degradation_log,
                 )
 
             # Confirmation mode: preguntar antes de acciones destructivas
@@ -573,6 +799,7 @@ REGLAS:
                         steps=steps,
                         iterations=iteration,
                         stuck=True,
+                        degradation_log=degradation_log,
                     )
 
         # Max iterations alcanzado
@@ -581,6 +808,7 @@ REGLAS:
             message=f"Límite de {self.max_iterations} iteraciones alcanzado sin completar",
             steps=steps,
             iterations=self.max_iterations,
+            degradation_log=degradation_log,
         )
 
     async def stream(

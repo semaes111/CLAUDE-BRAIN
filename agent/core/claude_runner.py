@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
+from agent.core.veracity import VERSION_COMPACT
+
 
 @dataclass
 class RunResult:
@@ -54,6 +56,22 @@ class ClaudeMaxRunner:
                 "Instalar: npm install -g @anthropic-ai/claude-code\n"
                 "Autenticar: claude auth login"
             )
+
+    def _build_system(self, extra_system: Optional[str] = None) -> str:
+        """
+        Construye el system prompt COMPLETO para cada llamada al CLI.
+
+        Siempre prefija VERSION_COMPACT para garantizar control epistémico
+        en TODAS las llamadas: AgenticLoop, Router, Condenser, multi_agent.
+
+        Estructura:
+          [VERSION_COMPACT]        ← normas epistémicas mínimas (siempre)
+          [extra_system]           ← contexto específico de la llamada (si lo hay)
+        """
+        parts = [VERSION_COMPACT.strip()]
+        if extra_system and extra_system.strip():
+            parts.append(extra_system.strip())
+        return "\n\n".join(parts)
 
     def _build_env(self) -> dict:
         """
@@ -99,8 +117,9 @@ class ClaudeMaxRunner:
         if allowed_tools:
             cmd.extend(["--allowedTools", ",".join(allowed_tools)])
 
-        if system:
-            cmd.extend(["--system", system])
+        # Siempre construir el system con VERSION_COMPACT como prefijo
+        final_system = self._build_system(system)
+        cmd.extend(["--system", final_system])
 
         cmd.append(task)
 

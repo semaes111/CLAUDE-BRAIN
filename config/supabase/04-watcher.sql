@@ -87,3 +87,30 @@ CREATE INDEX IF NOT EXISTS idx_mem0_hnsw
     ON mem0_memories
     USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
+
+-- ─────────────────────────────────────────────────────────
+-- Columnas epistémicas en la tabla interactions
+-- ─────────────────────────────────────────────────────────
+ALTER TABLE interactions
+  ADD COLUMN IF NOT EXISTS degradation_score     FLOAT   DEFAULT 0.0,
+  ADD COLUMN IF NOT EXISTS degradation_triggers  JSONB   DEFAULT '[]';
+
+-- Índice para consultar sesiones con alta degradación
+CREATE INDEX IF NOT EXISTS idx_interactions_degradation
+  ON interactions (degradation_score DESC)
+  WHERE degradation_score > 0.3;
+
+-- Vista: sesiones con problemas epistémicos
+CREATE OR REPLACE VIEW degradation_report AS
+SELECT
+  session_id,
+  COUNT(*)                                           AS total_interactions,
+  ROUND(AVG(degradation_score)::numeric, 3)          AS avg_degradation,
+  MAX(degradation_score)                             AS max_degradation,
+  COUNT(*) FILTER (WHERE degradation_score > 0.5)   AS severe_alerts,
+  MAX(created_at)                                    AS last_activity
+FROM interactions
+WHERE degradation_score > 0
+GROUP BY session_id
+ORDER BY avg_degradation DESC;
+
