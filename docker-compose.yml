@@ -293,6 +293,25 @@ services:
     restart: unless-stopped
 
   # ═══════════════════════════════════════════
+  # TELEGRAM BOT — La terminal del agente
+  # Recibe mensajes → Agent API → responde
+  # ═══════════════════════════════════════════
+  telegram-bot:
+    build:
+      context: ./telegram
+      dockerfile: Dockerfile
+    container_name: cb-telegram
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      # Tu user_id de Telegram (seguridad — solo tú puedes usarlo)
+      # Obtener con @userinfobot en Telegram
+      - TELEGRAM_ALLOWED_IDS=${TELEGRAM_ALLOWED_IDS}
+      - AGENT_API_URL=http://agent-api:8000
+    depends_on: [agent-api]
+    networks: [internal]
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════
   # EMBEDDINGS — nomic-embed-text LOCAL ($0/mes)
   # HuggingFace Text Embeddings Inference
   # 768 dims, 8192 ctx, ~270MB download inicial
