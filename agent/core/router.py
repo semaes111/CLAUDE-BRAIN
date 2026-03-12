@@ -1,19 +1,17 @@
 """
-SmartRouter — Enrutamiento automático de tareas al agente/skill correcto
+SmartRouter — Enrutamiento automático por lenguaje natural
 
-Proceso:
-  1. Recibe la tarea del usuario
-  2. Claude CLI analiza la tarea (subprocess, $0 extra)
-  3. Retorna: {agent, skills, command, reasoning}
-  4. El registry construye el prompt final
+Dos velocidades:
+  Fast path (< 5ms)  — reglas semánticas por keywords → cubre ~70% de los casos
+  LLM path  (~3s)    — Claude CLI analiza la tarea → para los casos ambiguos
 
-El Router usa el índice compacto del registry (~360 tokens)
-para que Claude conozca los 119 componentes disponibles.
+El objetivo es que el usuario nunca tenga que mencionar un agente ni una skill.
+Escribe "arregla este bug de TypeScript" y el router elige typescript-pro + systematic-debugging.
 """
 
 import json
-import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 from agent.core.claude_runner import ClaudeMaxRunner
 from agent.registry.component_registry import ComponentRegistry
@@ -21,137 +19,258 @@ from agent.registry.component_registry import ComponentRegistry
 
 @dataclass
 class RouteDecision:
-    agent: str | None        # Nombre del agente especialista (o None)
-    skills: list[str]        # Skills a activar
-    command: str | None      # Comando a ejecutar (o None)
-    command_args: str        # Argumentos para el comando
-    reasoning: str           # Por qué se tomó esta decisión
-    confidence: float        # 0.0 - 1.0
+    agent:        str | None    = None
+    skills:       list[str]     = field(default_factory=list)
+    command:      str | None    = None
+    command_args: str           = ""
+    reasoning:    str           = ""
+    confidence:   float         = 0.0
+    fast_path:    bool          = False   # True = heurístico, False = LLM
+
+
+# ── Tabla de reglas de enrutamiento rápido ───────────────────
+# (keywords → {agent, skills})
+# Se evalúa en orden, primer match gana
+
+FAST_RULES: list[dict] = [
+    # Revisión / auditoría
+    {
+        "keywords": ["review", "revisa", "audit", "audita", "analiza", "código", "code"],
+        "anti":     ["crea", "genera", "escribe", "build"],
+        "agent":    "code-reviewer",
+        "skills":   ["clean-code", "security-compliance"],
+        "command":  "code-review",
+    },
+    # Seguridad
+    {
+        "keywords": ["seguridad", "security", "vulnerab", "exploit", "injection", "xss", "csrf"],
+        "agent":    "code-reviewer",
+        "skills":   ["security-compliance"],
+        "command":  "security-audit",
+    },
+    # Debugging
+    {
+        "keywords": ["bug", "error", "falla", "crash", "exception", "debug", "arregla", "fix"],
+        "agent":    "debugger",
+        "skills":   ["systematic-debugging"],
+        "command":  "debug-error",
+    },
+    # Tests
+    {
+        "keywords": ["test", "tests", "testing", "unittest", "pytest", "jest", "spec"],
+        "agent":    "code-reviewer",
+        "skills":   ["best-practices"],
+        "command":  "generate-tests",
+    },
+    # Refactoring
+    {
+        "keywords": ["refactor", "refactoriza", "limpia", "clean", "simplifica", "mejora la estructura"],
+        "agent":    "refactoring-specialist",
+        "skills":   ["clean-code", "software-architecture"],
+        "command":  "refactor-code",
+    },
+    # Performance
+    {
+        "keywords": ["lento", "slow", "performance", "optimiza", "optimizar", "velocidad", "benchmark"],
+        "agent":    "performance-engineer",
+        "skills":   ["performance"],
+        "command":  "performance-audit",
+    },
+    # Next.js
+    {
+        "keywords": ["next.js", "nextjs", "next ", "app router", "server component", "vercel"],
+        "agent":    "nextjs-developer",
+        "skills":   ["nextjs-best-practices", "nextjs-supabase-auth"],
+    },
+    # React
+    {
+        "keywords": ["react", "componente", "component", "hook", "useState", "useEffect", "jsx", "tsx"],
+        "anti":     ["next.js", "nextjs"],
+        "agent":    "react-specialist",
+        "skills":   ["react-best-practices", "react-patterns"],
+    },
+    # TypeScript
+    {
+        "keywords": ["typescript", "ts ", ".ts", "tipos", "types", "interface", "generic"],
+        "agent":    "typescript-pro",
+        "skills":   ["typescript-expert"],
+    },
+    # Python
+    {
+        "keywords": ["python", "fastapi", "django", "flask", "pydantic", "asyncio", ".py"],
+        "agent":    "python-pro",
+        "skills":   ["python-patterns"],
+    },
+    # SQL / Postgres
+    {
+        "keywords": ["sql", "query", "postgres", "postgresql", "supabase", "rls", "migration"],
+        "agent":    "postgres-pro",
+        "skills":   ["supabase-postgres-best-practices"],
+        "command":  "optimize-database",
+    },
+    # Base de datos / esquemas
+    {
+        "keywords": ["schema", "esquema", "tabla", "tabla", "índice", "index", "relación", "foreign key"],
+        "agent":    "database-architect",
+        "skills":   ["supabase-postgres-best-practices"],
+    },
+    # Data / análisis
+    {
+        "keywords": ["datos", "data", "análisis", "pandas", "numpy", "dataframe", "csv", "excel"],
+        "agent":    "data-analyst",
+        "skills":   ["senior-data-scientist"],
+    },
+    # Mobile / Flutter / Swift
+    {
+        "keywords": ["flutter", "dart", "mobile", "android", "ios", "swift", "kotlin", "app móvil"],
+        "agent":    "mobile-developer",
+    },
+    # Frontend / UI
+    {
+        "keywords": ["ui", "ux", "diseño", "design", "css", "tailwind", "estilo", "animación"],
+        "agent":    "ui-ux-designer",
+        "skills":   ["tailwind-patterns", "frontend-design"],
+    },
+    # Backend / API
+    {
+        "keywords": ["api", "endpoint", "rest", "graphql", "backend", "servidor", "microservicio"],
+        "agent":    "backend-developer",
+        "skills":   ["backend-dev-guidelines", "api-patterns"],
+    },
+    # Arquitectura
+    {
+        "keywords": ["arquitectura", "architecture", "diseño de sistema", "system design", "escalab"],
+        "agent":    "backend-architect",
+        "skills":   ["software-architecture"],
+        "command":  "architecture-explorer",
+    },
+    # Documentación
+    {
+        "keywords": ["documenta", "documentación", "docs", "readme", "jsdoc", "openapi"],
+        "agent":    "fullstack-developer",
+        "command":  "generate-api-docs",
+    },
+    # JavaScript / Node
+    {
+        "keywords": ["javascript", "node", "nodejs", "npm", "yarn", "express", ".js"],
+        "anti":     ["react", "next"],
+        "agent":    "javascript-pro",
+        "skills":   ["nodejs-best-practices"],
+    },
+    # Fullstack general
+    {
+        "keywords": ["fullstack", "full stack", "aplicación completa", "app completa", "crea una app"],
+        "agent":    "fullstack-developer",
+        "skills":   ["senior-fullstack"],
+    },
+]
 
 
 class SmartRouter:
-    """
-    Analiza la tarea del usuario y selecciona automáticamente
-    el agente, skills y comandos más apropiados del registry.
-    """
-
-    ROUTER_SYSTEM = """Eres un router inteligente. Tu único trabajo es analizar tareas 
-y elegir los componentes correctos del registry disponible.
-Responde ÚNICAMENTE con JSON válido, sin markdown, sin explicaciones."""
-
     def __init__(self, runner: ClaudeMaxRunner, registry: ComponentRegistry):
-        self.runner = runner
+        self.runner   = runner
         self.registry = registry
 
     async def route(self, task: str) -> RouteDecision:
         """
-        Analiza la tarea y retorna la decisión de enrutamiento.
-        Si el análisis falla, retorna decisión segura (sin componentes específicos).
+        Enruta la tarea al componente correcto.
+        Primero intenta el fast path; si no hay match claro, usa el LLM.
         """
-        # Construir el prompt de análisis
-        index = self.registry.get_index_prompt()
+        decision = self._fast_route(task)
 
-        analysis_prompt = f"""{index}
+        # Si el fast path tiene buena confianza y los componentes existen → usarlo
+        if decision and decision.confidence >= 0.7:
+            return decision
 
-TAREA DEL USUARIO:
-{task[:1500]}
+        # LLM path para casos ambiguos
+        return await self._llm_route(task, fast_hint=decision)
 
-Analiza la tarea y elige los componentes óptimos. Responde SOLO con este JSON:
-{{
-  "agent": "nombre-del-agente-o-null",
-  "skills": ["skill1", "skill2"],
-  "command": "nombre-comando-o-null",
-  "command_args": "argumentos si aplica",
-  "reasoning": "explicación en 1 línea",
-  "confidence": 0.85
-}}
-
-Reglas:
-- agent: elige el especialista más relevante, null si la tarea es general
-- skills: 0-3 skills complementarias al agente
-- command: solo si la tarea pide exactamente lo que hace el comando
-- Si no hay componente claro, retorna todo null/vacío con confidence < 0.5
-- Los nombres deben coincidir EXACTAMENTE con los del registry"""
-
-        result = await self.runner.run(
-            task=analysis_prompt,
-            system=self.ROUTER_SYSTEM,
-            timeout=30,  # Análisis rápido
-        )
-
-        return self._parse_decision(result.output, task)
-
-    def _parse_decision(self, raw_output: str, task: str) -> RouteDecision:
-        """Parsea la decisión del router con validación."""
-        try:
-            # Limpiar posible markdown
-            clean = raw_output.strip()
-            if "```" in clean:
-                clean = clean.split("```")[1].lstrip("json").strip()
-            if clean.startswith("{"):
-                data = json.loads(clean)
-            else:
-                # Buscar JSON en el output
-                import re
-                match = re.search(r'\{[^}]+\}', clean, re.DOTALL)
-                data = json.loads(match.group()) if match else {}
-        except (json.JSONDecodeError, Exception):
-            return self._fallback_decision(task)
-
-        # Validar que los componentes existen en el registry
-        agent = data.get("agent")
-        if agent and not self.registry.get_agent(agent):
-            agent = None  # No existe, ignorar
-
-        skills = [
-            s for s in (data.get("skills") or [])
-            if self.registry.get_skill(s)
-        ]
-
-        command = data.get("command")
-        if command and not self.registry.get_command(command):
-            command = None
-
-        return RouteDecision(
-            agent=agent,
-            skills=skills,
-            command=command,
-            command_args=str(data.get("command_args", "")),
-            reasoning=str(data.get("reasoning", "análisis automático"))[:200],
-            confidence=float(data.get("confidence", 0.5)),
-        )
-
-    def _fallback_decision(self, task: str) -> RouteDecision:
-        """Decisión por defecto basada en keywords simples."""
+    def _fast_route(self, task: str) -> RouteDecision | None:
+        """Enrutamiento por reglas semánticas (<5ms)."""
         task_lower = task.lower()
 
-        # Heurísticas básicas como fallback
-        agent = None
-        skills = []
+        for rule in FAST_RULES:
+            keywords = rule.get("keywords", [])
+            anti     = rule.get("anti", [])
 
-        if any(k in task_lower for k in ["python", "fastapi", "django", "flask"]):
-            agent = "python-pro" if self.registry.get_agent("python-pro") else None
-        elif any(k in task_lower for k in ["next.js", "nextjs", "react", "frontend"]):
-            agent = "nextjs-developer" if self.registry.get_agent("nextjs-developer") else None
-        elif any(k in task_lower for k in ["sql", "database", "postgres", "supabase"]):
-            agent = "database-architect" if self.registry.get_agent("database-architect") else None
-        elif any(k in task_lower for k in ["typescript", "javascript"]):
-            agent = "typescript-pro" if self.registry.get_agent("typescript-pro") else None
+            # Verificar que hay al menos un keyword match
+            if not any(k in task_lower for k in keywords):
+                continue
 
-        if any(k in task_lower for k in ["review", "revisar", "audit"]):
-            if self.registry.get_skill("clean-code"):
-                skills.append("clean-code")
+            # Verificar que no hay keywords negativos
+            if any(k in task_lower for k in anti):
+                continue
 
-        return RouteDecision(
-            agent=agent,
-            skills=skills,
-            command=None,
-            command_args="",
-            reasoning="fallback heurístico",
-            confidence=0.4,
+            # Validar que los componentes existen en el registry
+            agent = rule.get("agent")
+            if agent and not self.registry.get_agent(agent):
+                agent = None  # Descartar si no está descargado
+
+            skills = [s for s in rule.get("skills", []) if self.registry.get_skill(s)]
+            command = rule.get("command")
+            if command and not self.registry.get_command(command):
+                command = None
+
+            # Calcular confianza basada en cuántos keywords matchean
+            matched = sum(1 for k in keywords if k in task_lower)
+            confidence = min(0.6 + (matched / len(keywords)) * 0.35, 0.95)
+
+            return RouteDecision(
+                agent=agent,
+                skills=skills[:2],  # Máximo 2 skills
+                command=command,
+                reasoning=f"fast-path: keywords {[k for k in keywords if k in task_lower][:3]}",
+                confidence=confidence,
+                fast_path=True,
+            )
+
+        return None  # Sin match → necesita LLM
+
+    async def _llm_route(self, task: str, fast_hint: RouteDecision | None = None) -> RouteDecision:
+        """Análisis LLM para tareas ambiguas."""
+        index = self.registry.get_index_prompt()
+        hint_text = ""
+        if fast_hint and fast_hint.agent:
+            hint_text = f"\nHint del fast-path: agent={fast_hint.agent}, skills={fast_hint.skills}"
+
+        prompt = f"""{index}
+{hint_text}
+
+TAREA: {task[:1000]}
+
+Elige los componentes más apropiados. Responde SOLO JSON:
+{{"agent":"nombre-o-null","skills":["s1","s2"],"command":"nombre-o-null","command_args":"","reasoning":"1 línea","confidence":0.9}}
+
+Máximo 2 skills. Nombres exactos del registry."""
+
+        result = await self.runner.run(
+            task=prompt,
+            system="Eres un router. Responde SOLO JSON válido, sin markdown.",
+            timeout=25,
         )
 
-    def route_sync(self, task: str) -> RouteDecision:
-        """Versión síncrona del router para uso en scripts."""
-        import asyncio
-        return asyncio.get_event_loop().run_until_complete(self.route(task))
+        return self._parse(result.output, task)
+
+    def _parse(self, raw: str, task: str) -> RouteDecision:
+        try:
+            clean = raw.strip()
+            if "```" in clean:
+                clean = clean.split("```")[1].lstrip("json").strip()
+            m = re.search(r'\{.*\}', clean, re.DOTALL)
+            data = json.loads(m.group() if m else clean)
+        except Exception:
+            return RouteDecision(reasoning="sin match", confidence=0.3)
+
+        agent  = data.get("agent")
+        skills = [s for s in (data.get("skills") or []) if self.registry.get_skill(s)]
+        command = data.get("command")
+
+        if agent and not self.registry.get_agent(agent): agent = None
+        if command and not self.registry.get_command(command): command = None
+
+        return RouteDecision(
+            agent=agent, skills=skills, command=command,
+            command_args=str(data.get("command_args", "")),
+            reasoning=str(data.get("reasoning", "llm-path"))[:200],
+            confidence=float(data.get("confidence", 0.7)),
+        )

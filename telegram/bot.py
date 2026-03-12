@@ -1,436 +1,341 @@
 """
-CLAUDE-BRAIN Telegram Bot — La terminal del agente
+CLAUDE-BRAIN Telegram Bot — Interfaz de lenguaje natural puro
 
-Flujo:
-  Tú → Telegram → Bot → Agent API (claude --print) → Respuesta → Telegram
+No hay comandos /agent ni /skill.
+Escribes lo que necesitas y el sistema elige automáticamente
+el agente, skills y comandos correctos de los 119 disponibles.
 
-Características:
-  - Streaming simulado: edita el mensaje mientras Claude responde
-  - Ficheros: sube archivos y el agente los procesa
-  - Skills: /skill nextjs-supabase-dev
-  - Multi-agente: /multi Crea una app completa...
-  - Código ejecutado en sandbox y resultado en mensaje
-  - Respuestas largas divididas automáticamente (límite Telegram: 4096 chars)
-  - Solo responde a tu TELEGRAM_USER_ID (seguridad)
+Únicos comandos utilitarios:
+  /exec   → sandbox de código
+  /mem    → buscar en memoria
+  /forget → borrar tu memoria
+  /status → estado del sistema
+  /debug  → muestra qué eligió el router (toggle)
 """
 
 import asyncio
-import httpx
+import json
 import os
-import textwrap
-from telegram import Update, Document
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes
-)
+import httpx
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode, ChatAction
 
-AGENT_API = os.getenv("AGENT_API_URL", "http://agent-api:8000")
-BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_IDS = set(
-    int(x.strip())
-    for x in os.getenv("TELEGRAM_ALLOWED_IDS", "").split(",")
+AGENT_API    = os.getenv("AGENT_API_URL", "http://agent-api:8000")
+BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
+ALLOWED_IDS  = set(
+    int(x.strip()) for x in os.getenv("TELEGRAM_ALLOWED_IDS", "").split(",")
     if x.strip().isdigit()
 )
-MAX_MSG = 4096   # Límite de Telegram
-STREAM_INTERVAL = 0.8  # Segundos entre ediciones del mensaje streaming
+MAX_MSG       = 4096
+STREAM_SECS   = 0.8
+
+# Estado por usuario: si debug está ON, muestra el routing decision
+_debug_users: set[int] = set()
 
 # ─────────────────────────────────────────────
-# GUARD — Solo usuarios autorizados
+# Helpers
 # ─────────────────────────────────────────────
 
 def authorized(update: Update) -> bool:
-    uid = update.effective_user.id
-    if ALLOWED_IDS and uid not in ALLOWED_IDS:
-        return False
-    return True
+    return not ALLOWED_IDS or update.effective_user.id in ALLOWED_IDS
 
 async def reject(update: Update):
     await update.message.reply_text("⛔ No autorizado.")
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-
 def chunk_text(text: str, size: int = MAX_MSG) -> list[str]:
-    """Divide texto largo en chunks respetando el límite de Telegram."""
     if len(text) <= size:
         return [text]
     chunks = []
     while text:
         if len(text) <= size:
-            chunks.append(text)
-            break
-        # Cortar en salto de línea si es posible
+            chunks.append(text); break
         cut = text.rfind("\n", 0, size)
-        if cut == -1:
-            cut = size
+        cut = cut if cut > 0 else size
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
     return chunks
 
 async def send_long(update: Update, text: str, parse_mode=None):
-    """Envía respuesta larga dividiéndola en múltiples mensajes."""
     chunks = chunk_text(text)
     for i, chunk in enumerate(chunks):
         prefix = f"_{i+1}/{len(chunks)}_\n" if len(chunks) > 1 else ""
         try:
-            await update.message.reply_text(
-                prefix + chunk,
-                parse_mode=parse_mode,
-            )
+            await update.message.reply_text(prefix + chunk, parse_mode=parse_mode)
         except Exception:
-            # Si falla con markdown, enviar como texto plano
             await update.message.reply_text(prefix + chunk)
 
-async def call_agent(
-    message: str,
-    session_id: str,
-    skill_names: list = None,
-    use_multiagent: bool = False,
-    timeout: int = 300,
-) -> str:
-    """Llama al Agent API y retorna la respuesta."""
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            f"{AGENT_API}/v1/chat",
-            json={
-                "message": message,
-                "session_id": session_id,
-                "skill_names": skill_names or [],
-                "use_memory": True,
-                "use_multiagent": use_multiagent,
-            }
-        )
-        resp.raise_for_status()
-        return resp.json()["response"]
-
-async def stream_agent(message: str, session_id: str) -> asyncio.Queue:
-    """Streaming SSE del agente → queue de tokens."""
-    q: asyncio.Queue = asyncio.Queue()
-
-    async def _fetch():
-        try:
-            async with httpx.AsyncClient(timeout=300) as client:
-                async with client.stream(
-                    "GET",
-                    f"{AGENT_API}/v1/chat/stream",
-                    params={"message": message, "session_id": session_id},
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                break
-                            import json
-                            try:
-                                event = json.loads(data)
-                                if event.get("type") == "token":
-                                    await q.put(event["data"])
-                            except Exception:
-                                pass
-        finally:
-            await q.put(None)  # Señal de fin
-
-    asyncio.create_task(_fetch())
-    return q
-
 # ─────────────────────────────────────────────
-# /start — Bienvenida
+# /start
 # ─────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        return await reject(update)
-
+    if not authorized(update): return await reject(update)
+    name = update.effective_user.first_name or "ahí"
     await update.message.reply_text(
-        "🧠 *CLAUDE-BRAIN* — Tu agente IA\n\n"
-        "Escríbeme cualquier tarea de desarrollo:\n"
-        "  `crea una API REST con FastAPI`\n"
-        "  `revisa mi código de auth`\n"
-        "  `busca las mejores prácticas de RLS en Supabase`\n\n"
-        "Comandos:\n"
-        "  /skill `nombre` — activa una skill\n"
-        "  /skills — lista skills disponibles\n"
-        "  /multi `tarea` — lanza múltiples agentes\n"
-        "  /exec `código` — ejecuta Python en sandbox\n"
-        "  /mem `búsqueda` — busca en memoria\n"
-        "  /status — estado del sistema\n"
-        "  /clear — limpia historial de sesión\n",
-        parse_mode=ParseMode.MARKDOWN,
+        f"🧠 Hola {name}. Soy CLAUDE-BRAIN.\n\n"
+        "Escríbeme lo que necesitas en lenguaje natural:\n\n"
+        "  _crea una API REST con FastAPI y PostgreSQL_\n"
+        "  _revisa la seguridad de este código_\n"
+        "  _optimiza esta query SQL_\n"
+        "  _busca las mejores prácticas de RLS en Supabase_\n\n"
+        "Elijo automáticamente el especialista y las herramientas.\n\n"
+        "Comandos utilitarios:\n"
+        "  /exec `código` — Python en sandbox seguro\n"
+        "  /mem `query` — buscar en tu memoria\n"
+        "  /forget — borrar tu memoria\n"
+        "  /debug — toggle: ver qué elige el router\n"
+        "  /status — estado del sistema",
+        parse_mode=ParseMode.MARKDOWN
     )
 
 # ─────────────────────────────────────────────
-# /skills — Listar skills disponibles
+# /debug — toggle para ver el routing decision
 # ─────────────────────────────────────────────
 
-async def cmd_skills(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return await reject(update)
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(f"{AGENT_API}/v1/skills")
-        skills = resp.json()["skills"]
-
-    text = "📦 *Skills disponibles:*\n\n"
-    for s in skills:
-        status = "✅" if s.get("active") else "⬜"
-        text += f"{status} `{s['name']}`\n  _{s['description'][:80]}_\n\n"
-    text += "Usar: `/skill nombre-skill tarea a realizar`"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    uid = update.effective_user.id
+    if uid in _debug_users:
+        _debug_users.discard(uid)
+        await update.message.reply_text("🔕 Debug OFF — respuestas limpias")
+    else:
+        _debug_users.add(uid)
+        await update.message.reply_text(
+            "🔍 Debug ON — verás qué agente/skills elige el router en cada respuesta"
+        )
 
 # ─────────────────────────────────────────────
-# /skill — Chat con skill específica
-# ─────────────────────────────────────────────
-
-async def cmd_skill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update): return await reject(update)
-
-    args = ctx.args
-    if not args:
-        await update.message.reply_text("Uso: `/skill nombre-skill tarea`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    skill_name = args[0]
-    task = " ".join(args[1:]) if len(args) > 1 else "Explica qué puedes hacer con esta skill"
-    session_id = str(update.effective_user.id)
-
-    msg = await update.message.reply_text(f"⚡ Usando skill `{skill_name}`...", parse_mode=ParseMode.MARKDOWN)
-    await update.effective_chat.send_action(ChatAction.TYPING)
-
-    try:
-        response = await call_agent(task, session_id, skill_names=[skill_name])
-        await msg.delete()
-        await send_long(update, response)
-    except Exception as e:
-        await msg.edit_text(f"❌ Error: {e}")
-
-# ─────────────────────────────────────────────
-# /multi — Orquestación multi-agente
-# ─────────────────────────────────────────────
-
-async def cmd_multi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update): return await reject(update)
-
-    task = " ".join(ctx.args) if ctx.args else ""
-    if not task:
-        await update.message.reply_text("Uso: `/multi tarea compleja aquí`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    session_id = str(update.effective_user.id)
-    msg = await update.message.reply_text("🤝 Coordinando múltiples agentes...")
-    await update.effective_chat.send_action(ChatAction.TYPING)
-
-    try:
-        response = await call_agent(task, session_id, use_multiagent=True, timeout=600)
-        await msg.delete()
-        await send_long(update, response)
-    except Exception as e:
-        await msg.edit_text(f"❌ Error: {e}")
-
-# ─────────────────────────────────────────────
-# /exec — Ejecutar código en sandbox
+# /exec — sandbox de código
 # ─────────────────────────────────────────────
 
 async def cmd_exec(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return await reject(update)
-
     code = " ".join(ctx.args) if ctx.args else ""
     if not code:
         await update.message.reply_text(
-            "Uso: `/exec print('hola')`\n\nO envíame un archivo .py directamente.",
+            "Uso: `/exec print('hola')`\nO envíame directamente un archivo .py",
             parse_mode=ParseMode.MARKDOWN
         )
         return
-
-    msg = await update.message.reply_text("🏃 Ejecutando en sandbox...")
-
+    msg = await update.message.reply_text("🏃 Ejecutando...")
     async with httpx.AsyncClient(timeout=45) as client:
         try:
-            resp = await client.post(
-                f"{AGENT_API}/v1/execute",
-                json={"code": code, "language": "python", "timeout": 30}
-            )
-            result = resp.json()
-            stdout = result.get("stdout", "").strip()
-            stderr = result.get("stderr", "").strip()
-            exit_code = result.get("exit_code", 0)
-
+            resp = await client.post(f"{AGENT_API}/v1/execute",
+                                     json={"code": code, "language": "python", "timeout": 30})
+            r = resp.json()
+            stdout = r.get("stdout", "").strip()
+            stderr = r.get("stderr", "").strip()
+            exit_code = r.get("exit_code", 0)
             icon = "✅" if exit_code == 0 else "❌"
-            output = f"{icon} *Resultado* (exit {exit_code}):\n```\n"
-            if stdout: output += stdout
-            if stderr: output += f"\nSTDERR:\n{stderr}"
-            output += "\n```"
-
-            await msg.edit_text(output[:MAX_MSG], parse_mode=ParseMode.MARKDOWN)
+            out = f"{icon} exit {exit_code}:\n```\n{stdout or '(sin output)'}"
+            if stderr: out += f"\nSTDERR: {stderr}"
+            out += "\n```"
+            await msg.edit_text(out[:MAX_MSG], parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
-            await msg.edit_text(f"❌ Error sandbox: {e}")
+            await msg.edit_text(f"❌ {e}")
 
 # ─────────────────────────────────────────────
-# /mem — Buscar en memoria
+# /mem — buscar en memoria
 # ─────────────────────────────────────────────
 
 async def cmd_mem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return await reject(update)
-
     query = " ".join(ctx.args) if ctx.args else ""
     if not query:
         await update.message.reply_text("Uso: `/mem qué buscas`", parse_mode=ParseMode.MARKDOWN)
         return
-
+    user_id = str(update.effective_user.id)
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(f"{AGENT_API}/v1/memory/search", params={"query": query, "limit": 5})
-        results = resp.json()["results"]
-
+        resp = await client.get(f"{AGENT_API}/v1/memory/search",
+                                params={"query": query, "user_id": user_id, "limit": 5})
+        results = resp.json().get("results", [])
     if not results:
-        await update.message.reply_text("🔍 Sin resultados en memoria.")
+        await update.message.reply_text("🔍 No encontré nada relevante en tu memoria.")
         return
-
     text = f"🔍 *Memoria — '{query}':*\n\n"
     for r in results:
-        sim = round(r.get("similarity", 0) * 100)
-        text += f"[{r['memory_type']} {sim}%] {r['content'][:200]}\n\n"
+        mem_text = r.get("memory", r.get("content", ""))
+        score = round(float(r.get("score", 0)) * 100)
+        text += f"[{score}%] {mem_text[:200]}\n\n"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 # ─────────────────────────────────────────────
-# /status — Estado del sistema
+# /forget — borrar toda la memoria del usuario
+# ─────────────────────────────────────────────
+
+async def cmd_forget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update): return await reject(update)
+    user_id = str(update.effective_user.id)
+    msg = await update.message.reply_text("🗑️ Borrando tu memoria...")
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.delete(f"{AGENT_API}/v1/memory/user/{user_id}")
+    await msg.edit_text("✅ Memoria borrada. Empezamos de cero.")
+
+# ─────────────────────────────────────────────
+# /status — estado del sistema
 # ─────────────────────────────────────────────
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return await reject(update)
-
     async with httpx.AsyncClient(timeout=20) as client:
         try:
-            resp = await client.get(f"{AGENT_API}/v1/status")
-            s = resp.json()
-            components = s.get("components", {})
-
-            claude = components.get("claude_cli", {})
-            redis  = components.get("redis", {})
-            supa   = components.get("supabase", {})
-            embed  = components.get("embeddings", {})
-
-            def icon(ok): return "✅" if ok else "❌"
-
+            s = (await client.get(f"{AGENT_API}/v1/status")).json()
+            m = (await client.get(f"{AGENT_API}/v1/watcher/metrics")).json()
+            reg = s.get("components", {}).get("registry", {})
+            claude = s.get("components", {}).get("claude_cli", {})
+            ok = lambda v: "✅" if v else "❌"
+            top = "\n".join(f"    `{k}` — {v}x" for k, v in (m.get("top_agents") or {}).items()) or "  _sin datos aún_"
             text = (
-                f"🧠 *CLAUDE-BRAIN Status*\n\n"
-                f"{icon(claude.get('ok'))} Claude CLI — {claude.get('billing', 'N/A')}\n"
-                f"{icon(redis.get('ok'))} Redis (working memory)\n"
-                f"{icon(supa.get('ok'))} Supabase pgvector\n"
-                f"{icon(embed.get('ok'))} nomic-embed-text (local)\n"
+                f"🧠 *CLAUDE-BRAIN v2*\n\n"
+                f"{ok(claude.get('ok'))} Claude Max OAuth — $0 extra\n\n"
+                f"📦 *Registry ({reg.get('total',0)} componentes):*\n"
+                f"  🤖 {reg.get('agents',0)} agentes\n"
+                f"  🎨 {reg.get('skills',0)} skills\n"
+                f"  ⚡ {reg.get('commands',0)} comandos\n\n"
+                f"📊 *Actividad:*\n"
+                f"  Requests totales: `{m.get('total_requests',0)}`\n"
+                f"  Éxito: `{m.get('success_rate',0)}%`\n"
+                f"  Latencia media: `{m.get('avg_latency_ms',0)}ms`\n"
+                f"  Tokens estimados: `{m.get('tokens_estimated_total',0):,}`\n\n"
+                f"🏆 *Agentes más usados:*\n{top}"
             )
             await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             await update.message.reply_text(f"❌ API no responde: {e}")
 
 # ─────────────────────────────────────────────
-# /clear — Limpiar sesión
-# ─────────────────────────────────────────────
-
-async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update): return await reject(update)
-    # El session_id es el user_id de Telegram — la memoria en Redis expira sola
-    # Podríamos llamar a un endpoint para borrarla, por ahora confirmamos
-    await update.message.reply_text("🗑️ Sesión limpiada. Nueva conversación iniciada.")
-
-# ─────────────────────────────────────────────
-# MENSAJE DE TEXTO — Chat principal con streaming
+# MENSAJE PRINCIPAL — Lenguaje natural puro
+# El router elige automáticamente agente/skills/comando
 # ─────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return await reject(update)
 
-    text = update.message.text
-    session_id = str(update.effective_user.id)
+    text     = update.message.text
+    uid      = update.effective_user.id
+    session  = str(uid)
+    show_debug = uid in _debug_users
 
-    # Mensaje inicial de "pensando..."
     msg = await update.message.reply_text("⏳")
     await update.effective_chat.send_action(ChatAction.TYPING)
 
-    # Streaming: acumular tokens y editar el mensaje periódicamente
+    # Streaming con edición periódica del mensaje
     try:
-        q = await stream_agent(text, session_id)
         accumulated = ""
-        last_edit = ""
-        edit_task = None
+        last_edit   = ""
+        route_info  = None  # se rellena desde la respuesta final
 
         async def do_edit():
             nonlocal last_edit
-            try:
-                if accumulated != last_edit and accumulated:
-                    display = accumulated[-MAX_MSG:] if len(accumulated) > MAX_MSG else accumulated
+            if accumulated != last_edit and accumulated:
+                display = accumulated[-MAX_MSG:] if len(accumulated) > MAX_MSG else accumulated
+                try:
                     await msg.edit_text(display + " ▋")
                     last_edit = accumulated
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-        while True:
-            try:
-                token = await asyncio.wait_for(q.get(), timeout=30)
-            except asyncio.TimeoutError:
-                break
+        async with httpx.AsyncClient(timeout=310) as client:
+            # Usar SSE streaming para la respuesta en tiempo real
+            async with client.stream(
+                "GET",
+                f"{AGENT_API}/v1/chat/stream",
+                params={"message": text, "session_id": session, "user_id": session}
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    try:
+                        event = json.loads(data)
+                        if event.get("type") == "token":
+                            accumulated += event["data"]
+                            if len(accumulated) % 50 == 0:  # editar cada ~50 chars
+                                asyncio.create_task(do_edit())
+                                await asyncio.sleep(STREAM_SECS)
+                        elif event.get("type") == "done":
+                            break
+                    except Exception:
+                        pass
 
-            if token is None:  # Fin del stream
-                break
+        # Si el streaming no devolvió nada, llamar al endpoint normal
+        if not accumulated:
+            r = await httpx.AsyncClient(timeout=310).post(
+                f"{AGENT_API}/v1/chat",
+                json={"message": text, "session_id": session, "user_id": session,
+                      "auto_route": True, "use_memory": True}
+            )
+            data = r.json()
+            accumulated = data.get("response", "Sin respuesta")
+            route_info  = data
 
-            accumulated += token
+        # Mensaje final
+        await msg.delete()
+        await send_long(update, accumulated)
 
-            # Editar cada STREAM_INTERVAL segundos
-            if not edit_task or edit_task.done():
-                edit_task = asyncio.create_task(do_edit())
-                await asyncio.sleep(STREAM_INTERVAL)
-
-        # Mensaje final completo
-        if edit_task and not edit_task.done():
-            edit_task.cancel()
-
-        if accumulated:
-            await msg.delete()
-            await send_long(update, accumulated)
-        else:
-            await msg.edit_text("❌ Sin respuesta del agente.")
+        # Debug: mostrar routing decision si está activado
+        if show_debug and route_info:
+            agent  = route_info.get("agent_used") or "ninguno"
+            skills = ", ".join(route_info.get("skills_used") or []) or "ninguna"
+            reason = route_info.get("routing_reasoning", "")
+            ms     = route_info.get("latency_ms", 0)
+            debug_text = (
+                f"🔍 _Router eligió:_\n"
+                f"  🤖 Agente: `{agent}`\n"
+                f"  🎨 Skills: `{skills}`\n"
+                f"  💭 _{reason}_\n"
+                f"  ⏱️ `{ms}ms`"
+            )
+            await update.message.reply_text(debug_text, parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        await msg.edit_text(f"❌ Error: {e}")
+        try:
+            await msg.edit_text(f"❌ Error: {e}")
+        except Exception:
+            await update.message.reply_text(f"❌ Error: {e}")
 
 # ─────────────────────────────────────────────
-# ARCHIVO — Procesar ficheros enviados
+# ARCHIVOS — El agente los analiza
 # ─────────────────────────────────────────────
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return await reject(update)
 
-    doc: Document = update.message.document
+    doc     = update.message.document
     caption = update.message.caption or "Analiza este archivo"
-    session_id = str(update.effective_user.id)
+    session = str(update.effective_user.id)
 
-    # Descargar el archivo
     msg = await update.message.reply_text(f"📥 Procesando `{doc.file_name}`...", parse_mode=ParseMode.MARKDOWN)
     await update.effective_chat.send_action(ChatAction.TYPING)
 
     try:
         file = await ctx.bot.get_file(doc.file_id)
-        content = bytes()
         async with httpx.AsyncClient() as client:
-            resp = await client.get(file.file_path)
-            content = resp.content
+            content = (await client.get(file.file_path)).content
 
-        # Si es texto, incluirlo directamente en el prompt
-        text_extensions = {".py", ".js", ".ts", ".md", ".txt", ".yaml", ".yml",
-                           ".json", ".sql", ".sh", ".env", ".toml", ".css", ".html"}
         ext = os.path.splitext(doc.file_name)[1].lower()
+        text_exts = {".py",".js",".ts",".tsx",".md",".txt",".yaml",".yml",
+                     ".json",".sql",".sh",".env",".toml",".css",".html",".jsx"}
 
-        if ext in text_extensions and len(content) < 50_000:
+        if ext in text_exts and len(content) < 50_000:
             file_content = content.decode("utf-8", errors="replace")
             task = f"{caption}\n\nArchivo: `{doc.file_name}`\n```\n{file_content}\n```"
         else:
-            task = f"{caption}\n\n(Archivo binario adjunto: {doc.file_name}, {len(content)} bytes)"
+            task = f"{caption}\n\n(Archivo: {doc.file_name}, {len(content):,} bytes)"
 
-        response = await call_agent(task, session_id)
+        async with httpx.AsyncClient(timeout=310) as client:
+            r = await client.post(f"{AGENT_API}/v1/chat", json={
+                "message": task, "session_id": session, "user_id": session,
+                "auto_route": True, "use_memory": True
+            })
+            response = r.json().get("response", "Sin respuesta")
+
         await msg.delete()
         await send_long(update, response)
 
     except Exception as e:
-        await msg.edit_text(f"❌ Error procesando archivo: {e}")
+        await msg.edit_text(f"❌ Error: {e}")
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -440,153 +345,27 @@ def main():
     if not BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN no configurado en .env")
 
-    print("🤖 CLAUDE-BRAIN Telegram Bot arrancando...")
-    print(f"   Agent API: {AGENT_API}")
-    print(f"   IDs autorizados: {ALLOWED_IDS or 'todos (¡configura TELEGRAM_ALLOWED_IDS!)'}")
+    print("🤖 CLAUDE-BRAIN Bot — Lenguaje natural puro")
+    print(f"   API: {AGENT_API}")
+    print(f"   IDs: {ALLOWED_IDS or 'todos'}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Comandos
+    # Solo comandos utilitarios — todo lo demás es lenguaje natural
     app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("skills", cmd_skills))
-    app.add_handler(CommandHandler("skill",  cmd_skill))
-    app.add_handler(CommandHandler("multi",  cmd_multi))
+    app.add_handler(CommandHandler("debug",  cmd_debug))
     app.add_handler(CommandHandler("exec",   cmd_exec))
     app.add_handler(CommandHandler("mem",    cmd_mem))
+    app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("clear",  cmd_clear))
 
-    # Mensajes de texto → chat con el agente
+    # Todo texto → router automático
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Archivos → procesado por el agente
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    print("✅ Bot listo — esperando mensajes...")
+    print("✅ Listo")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-
-# ─────────────────────────────────────────────
-# /agents — Listar agentes del registry
-# ─────────────────────────────────────────────
-
-async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update): return await reject(update)
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(f"{AGENT_API}/v1/registry/agents")
-        agents = resp.json().get("agents", [])
-    
-    by_cat = {}
-    for a in agents:
-        by_cat.setdefault(a["category"], []).append(a["name"])
-    
-    text = "🤖 *Agentes disponibles:*\n\n"
-    for cat, names in by_cat.items():
-        text += f"*[{cat}]*\n" + "\n".join(f"  `{n}`" for n in names) + "\n\n"
-    text += "Usar: `/agent nombre-agente tarea aquí`"
-    await send_long(update, text, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Lanza tarea con agente específico."""
-    if not authorized(update): return await reject(update)
-    args = ctx.args
-    if not args:
-        await update.message.reply_text("Uso: `/agent nombre-agente tarea`", parse_mode=ParseMode.MARKDOWN)
-        return
-    
-    agent_name = args[0]
-    task = " ".join(args[1:]) if len(args) > 1 else "Explica tus capacidades"
-    session_id = str(update.effective_user.id)
-    
-    msg = await update.message.reply_text(f"🤖 Usando agente `{agent_name}`...", parse_mode=ParseMode.MARKDOWN)
-    await update.effective_chat.send_action(ChatAction.TYPING)
-    
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(f"{AGENT_API}/v1/chat", json={
-                "message": task, "session_id": session_id,
-                "agent_name": agent_name, "auto_route": False
-            })
-            data = resp.json()
-        await msg.delete()
-        await send_long(update, data["response"])
-    except Exception as e:
-        await msg.edit_text(f"❌ Error: {e}")
-
-
-async def cmd_route(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Debug: muestra qué agente/skills elegiría el Router."""
-    if not authorized(update): return await reject(update)
-    task = " ".join(ctx.args) if ctx.args else ""
-    if not task:
-        await update.message.reply_text("Uso: `/route describe tu tarea`", parse_mode=ParseMode.MARKDOWN)
-        return
-    
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(f"{AGENT_API}/v1/route", params={"message": task})
-        d = resp.json()
-    
-    text = (
-        f"🧭 *Routing para:* _{task[:100]}_\n\n"
-        f"🤖 Agente:     `{d.get('agent') or 'ninguno'}`\n"
-        f"🎨 Skills:     `{', '.join(d.get('skills') or []) or 'ninguna'}`\n"
-        f"⚡ Comando:    `{d.get('command') or 'ninguno'}`\n"
-        f"💭 Razonamiento: _{d.get('reasoning', '')}_\n"
-        f"📊 Confianza:  `{round(float(d.get('confidence', 0)) * 100)}%`"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_watcher(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Métricas del Watcher."""
-    if not authorized(update): return await reject(update)
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(f"{AGENT_API}/v1/watcher/metrics")
-        m = resp.json()
-    
-    top = "\n".join(f"    `{k}`: {v}" for k, v in (m.get("top_agents") or {}).items())
-    text = (
-        f"📊 *Watcher Metrics*\n\n"
-        f"Total requests:     `{m.get('total_requests', 0)}`\n"
-        f"Success rate:       `{m.get('success_rate', 0)}%`\n"
-        f"Avg latency:        `{m.get('avg_latency_ms', 0)}ms`\n"
-        f"Requests/min:       `{m.get('current_rate_per_min', 0)}`\n"
-        f"Tokens estimados:   `{m.get('tokens_estimated_total', 0):,}`\n"
-        f"Requests activos:   `{m.get('active_requests', 0)}`\n\n"
-        f"Top agentes:\n{top or '  _sin datos aún_'}"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-
-# Registrar los nuevos handlers en main()
-_original_main = main
-
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN no configurado en .env")
-
-    print("🤖 CLAUDE-BRAIN Telegram Bot arrancando...")
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("skills",  cmd_skills))
-    app.add_handler(CommandHandler("skill",   cmd_skill))
-    app.add_handler(CommandHandler("agents",  cmd_agents))
-    app.add_handler(CommandHandler("agent",   cmd_agent))
-    app.add_handler(CommandHandler("multi",   cmd_multi))
-    app.add_handler(CommandHandler("exec",    cmd_exec))
-    app.add_handler(CommandHandler("mem",     cmd_mem))
-    app.add_handler(CommandHandler("route",   cmd_route))
-    app.add_handler(CommandHandler("watcher", cmd_watcher))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("clear",   cmd_clear))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    print("✅ Bot listo — esperando mensajes...")
-    app.run_polling(drop_pending_updates=True)
