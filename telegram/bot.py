@@ -16,6 +16,7 @@ el agente, skills y comandos correctos de los 119 disponibles.
 import asyncio
 import json
 import os
+import base64
 import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -351,14 +352,16 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("debug",  cmd_debug))
-    app.add_handler(CommandHandler("exec",   cmd_exec))
-    app.add_handler(CommandHandler("mem",    cmd_mem))
-    app.add_handler(CommandHandler("forget", cmd_forget))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("run",    cmd_run))
-    app.add_handler(CommandHandler("issue",  cmd_issue))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("debug",    cmd_debug))
+    app.add_handler(CommandHandler("exec",     cmd_exec))
+    app.add_handler(CommandHandler("kernel",   cmd_kernel))
+    app.add_handler(CommandHandler("krestart", cmd_kernel_restart))
+    app.add_handler(CommandHandler("mem",      cmd_mem))
+    app.add_handler(CommandHandler("forget",   cmd_forget))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("run",      cmd_run))
+    app.add_handler(CommandHandler("issue",    cmd_issue))
 
     # Todo texto → router automático (o agentic si dice "modo agente:")
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_smart))
@@ -541,3 +544,105 @@ async def handle_message_smart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Modo normal con router automático
     await handle_message(update, ctx)
+
+# ─────────────────────────────────────────────
+# /kernel — Celda IPython directa desde Telegram
+# Si hay imágenes matplotlib, las envía como fotos
+# ─────────────────────────────────────────────
+
+async def cmd_kernel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /kernel <código Python>
+    Ejecuta en el kernel con estado persistente.
+    Las variables se mantienen entre comandos.
+    Si genera plots, los envía como imagen en el chat.
+    """
+    if not authorized(update): return await reject(update)
+
+    code = " ".join(ctx.args) if ctx.args else ""
+    if not code:
+        await update.message.reply_text(
+            "💡 *Kernel IPython* — estado persistente entre celdas\n\n"
+            "Uso: `/kernel <código Python>`\n\n"
+            "Ejemplos:\n"
+            "  `/kernel import pandas as pd`\n"
+            "  `/kernel df = pd.read_csv('/workspaces/data.csv')`\n"
+            "  `/kernel df.describe()`\n"
+            "  `/kernel df.plot(); plt.savefig('/workspaces/plot.png')`\n\n"
+            "O envíame un archivo .py/.ipynb directamente.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    await _exec_kernel_code(update, code, str(update.effective_user.id))
+
+
+async def _exec_kernel_code(update: Update, code: str, session_id: str):
+    """Ejecuta código en el kernel y envía resultado + imágenes."""
+    msg = await update.message.reply_text("⚙️ Ejecutando kernel...")
+
+    try:
+        async with httpx.AsyncClient(timeout=150) as client:
+            resp = await client.post(
+                f"{AGENT_API}/v1/jupyter/execute",
+                json={"code": code, "session_id": session_id, "timeout": 120}
+            )
+            result = resp.json()
+
+        text       = result.get("text", "").strip()
+        images     = result.get("images", [])
+        error      = result.get("error")
+        exec_count = result.get("exec_count", 0)
+        ms         = result.get("duration_ms", 0)
+        ok         = result.get("success", False)
+
+        # Texto de la celda
+        icon     = "✅" if ok else "❌"
+        header   = f"{icon} *In [{exec_count}]* `{ms}ms`\n"
+        body     = f"```\n{text}\n```" if text else ""
+        err_text = f"\n❌ *Error:*\n```\n{error}\n```" if error else ""
+        full     = header + body + err_text
+
+        await msg.delete()
+
+        if full.strip() != header.strip():  # hay contenido
+            try:
+                await update.message.reply_text(full[:MAX_MSG], parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await update.message.reply_text(f"In [{exec_count}]:\n{text or error}")
+
+        # Enviar imágenes matplotlib como fotos
+        for i, img_b64 in enumerate(images):
+            try:
+                img_bytes = base64.b64decode(img_b64)
+                import io
+                buf = io.BytesIO(img_bytes)
+                buf.name = f"plot_{exec_count}_{i}.png"
+                await update.message.reply_photo(
+                    photo=buf,
+                    caption=f"📊 Plot [{exec_count}]"
+                )
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Error enviando imagen: {e}")
+
+        # Si no hubo ningún output
+        if not text and not error and not images:
+            await update.message.reply_text(f"✅ *In [{exec_count}]* `{ms}ms` — sin output", parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        try:
+            await msg.edit_text(f"❌ Error: {e}")
+        except Exception:
+            pass
+
+
+async def cmd_kernel_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/krestart — Reinicia el kernel (limpia variables)"""
+    if not authorized(update): return await reject(update)
+    session = str(update.effective_user.id)
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(f"{AGENT_API}/v1/jupyter/restart/{session}")
+        ok = resp.json().get("restarted", False)
+    icon = "✅" if ok else "❌"
+    await update.message.reply_text(f"{icon} Kernel {'reiniciado' if ok else 'no encontrado'} — variables limpiadas.")
+

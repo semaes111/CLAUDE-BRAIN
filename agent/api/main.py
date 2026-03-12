@@ -355,3 +355,83 @@ async def git_diff():
 @app.get("/v1/git/status")
 async def git_status():
     return {"status": await _git.get_status()}
+
+# ─────────────────────────────────────────────────────────
+# JUPYTER KERNEL ENDPOINTS
+# ─────────────────────────────────────────────────────────
+
+from agent.core.jupyter_kernel import JupyterKernelManager
+
+_jupyter_manager = JupyterKernelManager()
+
+@app.on_event("startup")
+async def startup_jupyter():
+    await _jupyter_manager.start()
+
+@app.on_event("shutdown")
+async def shutdown_jupyter():
+    await _jupyter_manager.stop()
+
+
+class CellRequest(BaseModel):
+    code:       str = Field(..., min_length=1, max_length=100_000)
+    session_id: str = "default"
+    timeout:    int = Field(default=120, ge=1, le=600)
+
+
+@app.post("/v1/jupyter/execute")
+async def jupyter_execute(req: CellRequest):
+    """
+    Ejecuta una celda Python en el kernel de la sesión.
+    Variables persisten entre llamadas (estado de notebook).
+    Retorna texto + imágenes base64 si hay plots matplotlib.
+    """
+    result = await _jupyter_manager.execute(
+        session_id=req.session_id,
+        code=req.code,
+        timeout=req.timeout,
+    )
+    return {
+        "text":        result.text,
+        "images":      result.images,      # lista de base64 PNG
+        "error":       result.error,
+        "exec_count":  result.exec_count,
+        "success":     result.success,
+        "duration_ms": result.duration_ms,
+        "has_images":  len(result.images) > 0,
+    }
+
+
+@app.post("/v1/jupyter/restart/{session_id}")
+async def jupyter_restart(session_id: str):
+    """Reinicia el kernel (limpia todas las variables)."""
+    ok = await _jupyter_manager.restart(session_id)
+    return {"restarted": ok, "session_id": session_id}
+
+
+@app.delete("/v1/jupyter/kernel/{session_id}")
+async def jupyter_kill(session_id: str):
+    """Mata el kernel de una sesión."""
+    await _jupyter_manager.kill(session_id)
+    return {"killed": session_id}
+
+
+@app.get("/v1/jupyter/kernels")
+async def jupyter_list():
+    """Lista todos los kernels activos."""
+    return {
+        "kernels":   await _jupyter_manager.list_kernels(),
+        "available": await _jupyter_manager.is_available(),
+    }
+
+
+@app.get("/v1/jupyter/status")
+async def jupyter_status():
+    available = await _jupyter_manager.is_available()
+    kernels   = await _jupyter_manager.list_kernels()
+    return {
+        "available":     available,
+        "active_kernels": len(kernels),
+        "kernels":        kernels,
+        "jupyter_url":    _jupyter_manager.JUPYTER_URL,
+    }

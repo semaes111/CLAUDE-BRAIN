@@ -31,3 +31,4 @@ gitpython==3.1.43
 
 # HTML parsing (browser fallback)
 html2text==2024.2.26
+websockets==13.1

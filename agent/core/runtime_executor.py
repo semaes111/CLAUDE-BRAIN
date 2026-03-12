@@ -23,6 +23,7 @@ import re
 from pathlib import Path
 
 from agent.core.agentic_loop import Action, ActionType, Observation
+from agent.core.jupyter_kernel import JupyterKernelManager
 
 
 DANGEROUS_PATTERNS = [
@@ -63,6 +64,9 @@ class RuntimeExecutor:
         self.enable_browser = enable_browser
         self._runner        = runner
         self._browser       = None
+        self._jupyter       = JupyterKernelManager()
+        # Session ID activa (se rellena por el loop en cada ejecución)
+        self._current_session: str = "default"
 
     async def execute(self, action: Action, cwd: str = None) -> Observation:
         """Dispatch al executor correcto según el tipo de acción."""
@@ -80,6 +84,8 @@ class RuntimeExecutor:
                     return await self._exec_edit(action, work_dir)
                 case ActionType.BROWSE:
                     return await self._exec_browse(action)
+                case ActionType.IPYTHON:
+                    return await self._exec_ipython(action)
                 case ActionType.THINK:
                     return Observation(
                         action_type=ActionType.THINK,
@@ -395,6 +401,41 @@ class RuntimeExecutor:
                 )
             finally:
                 await browser.close()
+
+    # ─────────────────────────────────────────────
+    # IPYTHON — Kernel Python con estado persistente
+    # ─────────────────────────────────────────────
+
+    async def _exec_ipython(self, action: Action) -> Observation:
+        """
+        Ejecuta código en el kernel Jupyter de la sesión actual.
+        Las variables persisten entre llamadas (como en un notebook).
+        Si hay imágenes (matplotlib), se incluyen en la observación.
+        """
+        code    = action.payload.get("code", "")
+        timeout = int(action.payload.get("timeout", 120))
+        session = self._current_session
+
+        cell_result = await self._jupyter.execute(
+            session_id=session,
+            code=code,
+            timeout=timeout,
+        )
+
+        # Construir texto de observación
+        obs_text = cell_result.to_observation_text()
+
+        return Observation(
+            action_type=ActionType.IPYTHON,
+            content=obs_text,
+            success=cell_result.success,
+            metadata={
+                "images":      cell_result.images,  # base64 PNGs
+                "exec_count":  cell_result.exec_count,
+                "duration_ms": cell_result.duration_ms,
+                "has_images":  len(cell_result.images) > 0,
+            },
+        )
 
     # ─────────────────────────────────────────────
     # DELEGATE

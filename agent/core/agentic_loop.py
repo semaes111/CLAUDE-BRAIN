@@ -37,6 +37,7 @@ class ActionType(str, Enum):
     WRITE   = "write"      # Escribir archivo
     EDIT    = "edit"       # Editar líneas de archivo
     BROWSE  = "browse"     # Abrir URL en browser
+    IPYTHON = "ipython"    # Celda IPython con estado persistente (pandas, plt, sklearn...)
     THINK   = "think"      # Pensamiento interno (no ejecuta nada)
     FINISH  = "finish"     # Tarea completada
     REJECT  = "reject"     # Tarea rechazada (imposible o fuera de scope)
@@ -55,6 +56,7 @@ class Action:
     # WRITE:    payload = {"path": "src/app.py", "content": "..."}
     # EDIT:     payload = {"path": "src/app.py", "old": "...", "new": "..."}
     # BROWSE:   payload = {"url": "https://...", "action": "goto|click|type|scroll"}
+    # IPYTHON:  payload = {"code": "import pandas as pd\ndf = pd.read_csv('data.csv')\ndf.head()"}
     # THINK:    payload = {"thought": "debo analizar..."}
     # FINISH:   payload = {"message": "Completado: ...", "outputs": {}}
     # REJECT:   payload = {"reason": "No puedo..."}
@@ -530,6 +532,8 @@ REGLAS:
                 # para pedir confirmación antes de continuar
                 pass
 
+            # Pasar session_id al runtime para que el kernel sepa en qué sesión está
+            self.runtime._current_session = session_id
             observation = await self.runtime.execute(action, cwd=cwd)
 
             step = AgentStep(

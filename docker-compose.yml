@@ -76,6 +76,8 @@ services:
 
       # ── Config del agente ──────────────────────────────────
       - AGENT_MAX_TURNS=${AGENT_MAX_TURNS:-25}
+      - JUPYTER_URL=http://jupyter:8888
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-claude-brain-jupyter-token}
       - AGENT_TIMEOUT_SECONDS=${AGENT_TIMEOUT_SECONDS:-300}
       - AGENT_MAX_SUBAGENTS=${AGENT_MAX_SUBAGENTS:-4}
     volumes:
@@ -311,6 +313,28 @@ services:
     depends_on: [agent-api]
     networks: [internal]
     restart: unless-stopped
+
+  # ═══════════════════════════════════════════
+  # JUPYTER — Kernel Python científico
+  # Un kernel por sesión, estado persistente
+  # ═══════════════════════════════════════════
+  jupyter:
+    build:
+      context: ./jupyter
+      dockerfile: Dockerfile
+    container_name: cb-jupyter
+    environment:
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-claude-brain-jupyter-token}
+    volumes:
+      # Workspace compartido con el agente
+      - workspaces:/workspaces
+    networks: [internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/api?token=claude-brain-jupyter-token"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # ═══════════════════════════════════════════
   # EMBEDDINGS — nomic-embed-text LOCAL ($0/mes)
