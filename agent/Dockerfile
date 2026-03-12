@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # ─────────────────────────────────────────────
-# Dependencias Python
+# Dependencias Python (incluye mem0ai)
 # ─────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -26,10 +26,18 @@ COPY . .
 # ─────────────────────────────────────────────
 # Directorios persistentes
 # ─────────────────────────────────────────────
-RUN mkdir -p /workspaces /app/skills /root/.claude
+RUN mkdir -p /workspaces /app/skills /app/components/agents \
+             /app/components/skills /app/components/commands /root/.claude
 
 # ─────────────────────────────────────────────
-# Entrypoint — gestiona auth automáticamente
+# Descargar 119 componentes de aitmpl.com
+# Se hace en build time para que estén disponibles al arrancar
+# ─────────────────────────────────────────────
+COPY ../scripts/install-aitmpl.sh /tmp/install-aitmpl.sh
+RUN chmod +x /tmp/install-aitmpl.sh && /tmp/install-aitmpl.sh || true
+
+# ─────────────────────────────────────────────
+# Entrypoint — gestiona auth OAuth
 # ─────────────────────────────────────────────
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

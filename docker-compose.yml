@@ -200,6 +200,7 @@ services:
       - supabase_db:/var/lib/postgresql/data
       - ./config/supabase/01-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql
       - ./config/supabase/02-memories.sql:/docker-entrypoint-initdb.d/02-memories.sql
+      - ./config/supabase/04-watcher.sql:/docker-entrypoint-initdb.d/04-watcher.sql
     ports:
       - "5432:5432"     # Acceso directo a PostgreSQL
     networks: [internal]

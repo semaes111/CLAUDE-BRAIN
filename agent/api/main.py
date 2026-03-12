@@ -1,22 +1,18 @@
 """
-CLAUDE-BRAIN API — FastAPI REST + WebSocket
+CLAUDE-BRAIN API v2 — FastAPI
 
-Endpoints:
-  POST /v1/chat          → Chat con agente (Max OAuth, $0 extra)
-  GET  /v1/chat/stream   → Streaming SSE
-  WS   /ws/{session_id}  → WebSocket bidireccional
-  GET  /v1/skills        → Listar skills
-  POST /v1/skills/activate → Activar skill
-  GET  /v1/memory/search → Búsqueda semántica
-  POST /v1/execute       → Ejecutar código en sandbox
-  GET  /v1/status        → Health check
+Flujo de una petición:
+  1. POST /v1/chat → Watcher.observe() inicia observación
+  2. SmartRouter.route() → elige agent/skills/command automáticamente
+  3. Mem0Manager.build_context() → recupera memoria relevante (3 capas)
+  4. ComponentRegistry.build_prompt() → system + user prompt
+  5. ClaudeMaxRunner.run() → subprocess claude CLI (Max OAuth, $0 extra)
+  6. Mem0Manager.remember() → extrae memorias (async)
+  7. Watcher persiste → Supabase + Redis
 """
 
-import asyncio
-import json
-import os
+import asyncio, json, os, time
 from typing import Optional
-
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,252 +20,193 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent.core.claude_runner import ClaudeMaxRunner
-from agent.memory.memory_manager import MemoryManager
+from agent.core.router import SmartRouter
+from agent.core.watcher import Watcher
+from agent.memory.mem0_manager import Mem0Manager
 from agent.orchestrator.multi_agent import MultiAgentOrchestrator
-from agent.skills.skill_manager import SkillManager
+from agent.registry.component_registry import ComponentRegistry
 
-# ─────────────────────────────────────────────
-# INICIALIZACIÓN
-# ─────────────────────────────────────────────
+app = FastAPI(title="CLAUDE-BRAIN API v2", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app = FastAPI(
-    title="CLAUDE-BRAIN API",
-    description="Autonomous AI Agent powered by Claude Code Max (Zero extra API billing)",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Componentes del agente
-runner = ClaudeMaxRunner()
-memory = MemoryManager()
-skills = SkillManager()
-orchestrator = MultiAgentOrchestrator(
-    runner=runner,
-    max_concurrent=int(os.getenv("AGENT_MAX_SUBAGENTS", "4")),
-)
-
-SANDBOX_URL = "http://sandbox-api:8080"
-
-# ─────────────────────────────────────────────
-# MODELOS PYDANTIC
-# ─────────────────────────────────────────────
+runner       = ClaudeMaxRunner()
+registry     = ComponentRegistry()
+router_ai    = SmartRouter(runner=runner, registry=registry)
+watcher      = Watcher()
+memory       = Mem0Manager()
+orchestrator = MultiAgentOrchestrator(runner=runner, max_concurrent=int(os.getenv("AGENT_MAX_SUBAGENTS","4")))
+SANDBOX_URL  = os.getenv("SANDBOX_URL", "http://sandbox-api:8080")
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., description="Mensaje o tarea para el agente")
-    session_id: str = Field(default="default", description="ID de sesión para memoria")
-    skill_names: list[str] = Field(default=[], description="Skills a activar")
-    use_memory: bool = Field(default=True, description="Usar memoria persistente")
-    use_multiagent: bool = Field(default=False, description="Permitir subagentes paralelos")
-    cwd: Optional[str] = Field(default=None, description="Directorio de trabajo")
-    tools: Optional[list[str]] = Field(default=None, description="Tools específicas a usar")
-
-class ChatResponse(BaseModel):
-    response: str
-    session_id: str
-    billing: str = "Max OAuth (no API billing)"
+    message:        str
+    session_id:     str       = "default"
+    user_id:        str       = "default"
+    agent_name:     Optional[str]   = None
+    skill_names:    list[str]       = []
+    command_name:   Optional[str]   = None
+    command_args:   str             = ""
+    auto_route:     bool = True
+    use_memory:     bool = True
+    use_multiagent: bool = False
+    cwd:            Optional[str]   = None
 
 class ExecuteRequest(BaseModel):
-    code: str = Field(..., max_length=50000)
+    code:     str = Field(..., max_length=50000)
     language: str = Field(default="python", pattern="^(python|javascript|bash)$")
-    timeout: int = Field(default=30, ge=1, le=60)
+    timeout:  int = Field(default=30, ge=1, le=60)
 
-class SkillActivateRequest(BaseModel):
-    name: str
-
-# ─────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────
-
-@app.post("/v1/chat", response_model=ChatResponse)
+@app.post("/v1/chat")
 async def chat(req: ChatRequest):
-    """
-    Chat principal con el agente.
-    Usa Claude Code Max OAuth → sin billing adicional.
-    """
-    # 1. Construir contexto de memoria
-    memory_ctx = ""
-    if req.use_memory:
-        memory_ctx = await memory.build_context(req.session_id, req.message)
+    t0 = time.time()
+    async with watcher.observe(req.session_id, req.message) as ctx:
+        # Routing automático o manual
+        if req.auto_route and not req.agent_name and not req.skill_names:
+            d = await router_ai.route(req.message)
+            agent_name, skill_names = d.agent, d.skills
+            command_name, command_args, reasoning = d.command, d.command_args, d.reasoning
+        else:
+            agent_name, skill_names = req.agent_name, req.skill_names
+            command_name, command_args, reasoning = req.command_name, req.command_args, "manual"
 
-    # 2. Construir prompt con skills y memoria
-    task = skills.build_task_prompt(
-        user_task=req.message,
-        skill_names=req.skill_names,
-        memory_context=memory_ctx,
-    )
+        ctx.set_routing(agent_name, skill_names, command_name, reasoning, 1.0)
 
-    # 3. Obtener tools (built-in + skills activas)
-    agent_tools = req.tools or (runner.BUILTIN_TOOLS + skills.get_active_tools())
+        # Memoria
+        memory_ctx = ""
+        if req.use_memory:
+            memory_ctx = await memory.build_context(req.user_id, req.session_id, req.message)
 
-    # 4. Ejecutar
-    if req.use_multiagent:
-        response = await orchestrator.orchestrate(task)
-    else:
-        result = await runner.run_with_tools(
-            task=task,
-            tools=list(set(agent_tools)),
-            cwd=req.cwd,
-            system=skills.get_system_prompt(),
+        # Prompt
+        system_prompt, user_prompt, tools = registry.build_prompt(
+            task=req.message, agent_name=agent_name, skill_names=skill_names,
+            command_name=command_name, command_args=command_args, memory_context=memory_ctx,
         )
-        response = result.output
 
-    # 5. Guardar en memoria (async, no bloquea)
-    if req.use_memory:
-        memory.add_message(req.session_id, "user", req.message)
-        memory.add_message(req.session_id, "assistant", response[:2000])
-        asyncio.create_task(memory.extract_and_save(req.session_id, runner))
+        # Ejecutar
+        if req.use_multiagent:
+            response, success = await orchestrator.orchestrate(user_prompt), True
+        else:
+            result = await runner.run(task=user_prompt, system=system_prompt, allowed_tools=tools, cwd=req.cwd)
+            response, success = result.output, result.success
 
-    return ChatResponse(response=response, session_id=req.session_id)
+        ctx.set_result(response, success)
 
+        # Memoria async
+        if req.use_memory:
+            memory.add_message(req.session_id, "user", req.message)
+            memory.add_message(req.session_id, "assistant", response[:2000])
+            history = memory.get_history(req.session_id, n=10)
+            asyncio.create_task(memory.remember(history, user_id=req.user_id, session_id=req.session_id))
+
+    return {
+        "response": response, "session_id": req.session_id, "user_id": req.user_id,
+        "agent_used": agent_name, "skills_used": skill_names or [],
+        "routing_reasoning": reasoning, "latency_ms": int((time.time()-t0)*1000),
+        "billing": "Max OAuth ($0 extra)"
+    }
 
 @app.get("/v1/chat/stream")
-async def chat_stream(
-    message: str,
-    session_id: str = "default",
-    cwd: Optional[str] = None,
-):
-    """Streaming SSE — tokens en tiempo real."""
-    async def generate():
-        async for token in runner.stream(message, cwd=cwd):
-            yield f"data: {json.dumps({'type': 'token', 'data': token})}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
+async def chat_stream(message: str, session_id: str = "default"):
+    async def gen():
+        async for token in runner.stream(message):
+            yield f"data: {json.dumps({'type':'token','data':token})}\n\n"
+        yield f"data: {json.dumps({'type':'done'})}\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 @app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """WebSocket bidireccional para chat en tiempo real."""
+async def ws(websocket: WebSocket, session_id: str):
     await websocket.accept()
     try:
         while True:
-            message = await websocket.receive_text()
-            await websocket.send_json({"type": "start"})
-
-            async for token in runner.stream(message):
-                await websocket.send_json({"type": "token", "data": token})
-
-            memory.add_message(session_id, "user", message)
-            await websocket.send_json({"type": "done"})
-
+            msg = await websocket.receive_text()
+            await websocket.send_json({"type":"start"})
+            async for token in runner.stream(msg):
+                await websocket.send_json({"type":"token","data":token})
+            await websocket.send_json({"type":"done"})
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        await websocket.send_json({"type": "error", "data": str(e)})
-        await websocket.close()
 
+@app.get("/v1/registry")
+def get_registry():
+    return {"summary": registry.summary(), "catalog": registry.catalog()}
 
-@app.get("/v1/skills")
+@app.get("/v1/registry/agents")
+def list_agents():
+    return {"agents": [{"name":a.name,"description":a.description,"category":a.category} for a in registry.agents.values()]}
+
+@app.get("/v1/registry/skills")
 def list_skills():
-    """Lista todas las skills disponibles."""
-    return {"skills": skills.list_skills()}
+    return {"skills": [{"name":s.name,"description":s.description,"source":s.source} for s in registry.skills.values()]}
 
+@app.get("/v1/registry/commands")
+def list_commands():
+    return {"commands": [{"name":c.name,"description":c.description,"argument_hint":c.argument_hint} for c in registry.commands.values()]}
 
-@app.post("/v1/skills/activate")
-def activate_skill(req: SkillActivateRequest):
-    """Activa una skill."""
-    skill = skills.activate(req.name)
-    if not skill:
-        return {"error": f"Skill '{req.name}' no encontrada"}, 404
-    return {"activated": req.name, "tools_required": skill.tools_required}
+@app.post("/v1/registry/reload")
+def reload_registry():
+    registry.reload()
+    return {"reloaded": registry.summary()}
 
-
-@app.post("/v1/skills/reload")
-def reload_skills():
-    """Recarga todas las skills desde disco."""
-    skills.reload()
-    return {"skills_loaded": len(skills._registry)}
-
+@app.post("/v1/route")
+async def route_task(message: str):
+    d = await router_ai.route(message)
+    return {"agent": d.agent, "skills": d.skills, "command": d.command,
+            "reasoning": d.reasoning, "confidence": d.confidence}
 
 @app.get("/v1/memory/search")
-async def search_memory(
-    query: str,
-    memory_type: Optional[str] = None,
-    limit: int = 5,
-):
-    """Búsqueda semántica en la memoria persistente."""
-    results = await memory.search_memory(query, memory_type=memory_type, limit=limit)
-    return {"results": results, "count": len(results)}
+async def search_memory(query: str, user_id: str = "default", limit: int = 5):
+    return {"results": await memory.recall(query, user_id=user_id, limit=limit)}
 
+@app.get("/v1/memory/all")
+async def get_all_memory(user_id: str = "default"):
+    return {"memories": await memory.get_all_memories(user_id=user_id)}
+
+@app.delete("/v1/memory/user/{user_id}")
+async def delete_user_memory(user_id: str):
+    await memory.reset_user(user_id)
+    return {"deleted": user_id}
+
+@app.post("/v1/memory/fact")
+def save_fact(user_id: str, category: str, content: str):
+    memory.save_fact(user_id, category, content)
+    return {"saved": True}
+
+@app.get("/v1/watcher/metrics")
+def get_metrics():
+    return watcher.get_metrics()
+
+@app.get("/v1/watcher/history/{session_id}")
+async def get_history(session_id: str, limit: int = 20):
+    return {"history": await watcher.get_history(session_id, limit)}
 
 @app.post("/v1/execute")
 async def execute_code(req: ExecuteRequest):
-    """
-    Ejecuta código en sandbox aislado (snekbox/nsjail).
-    Python, JavaScript, Bash con restricciones de seguridad.
-    """
     async with httpx.AsyncClient(timeout=req.timeout + 10) as client:
         try:
-            resp = await client.post(
-                f"{SANDBOX_URL}/execute",
-                json={
-                    "code": req.code,
-                    "language": req.language,
-                    "timeout": req.timeout,
-                },
-            )
+            resp = await client.post(f"{SANDBOX_URL}/execute", json=req.dict())
             return resp.json()
         except httpx.ConnectError:
             return {"error": "Sandbox no disponible", "exit_code": 1}
 
+# Endpoint OpenAI-compatible para que mem0 use el CLI como LLM extractor
+@app.post("/v1/openai-compat/chat/completions")
+async def openai_compat(request: dict):
+    messages = request.get("messages", [])
+    prompt = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+    result = await runner.run(prompt, timeout=60)
+    return {"choices": [{"message": {"role":"assistant","content": result.output}, "finish_reason":"stop"}],
+            "model": "claude-code-max"}
 
 @app.get("/v1/status")
 async def status():
-    """Health check completo del sistema."""
-    # Test Claude CLI con Max OAuth
-    test = await runner.run("responde solo: OK", timeout=30)
-
+    test = await runner.run("OK", timeout=30)
     return {
         "status": "healthy" if test.success else "degraded",
+        "version": "2.0.0",
         "components": {
-            "claude_cli": {
-                "ok": test.success,
-                "billing": "Max OAuth (no API billing)",
-                "note": "claude --print sin ANTHROPIC_API_KEY",
-            },
-            "redis": _check_redis(),
-            "supabase": _check_supabase(),
-            "embeddings": await _check_embeddings(),
-        },
-        "version": "1.0.0",
+            "claude_cli": {"ok": test.success, "billing": "Max OAuth ($0 extra)"},
+            "registry": registry.summary(),
+            "memory": {"mem0_ready": memory._mem0_ready},
+            "watcher": watcher.get_metrics(),
+        }
     }
-
-
-def _check_redis() -> dict:
-    try:
-        memory.redis.ping()
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def _check_supabase() -> dict:
-    try:
-        memory.supabase.table("agent_memories").select("id").limit(1).execute()
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-async def _check_embeddings() -> dict:
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{memory.embed_url}/health")
-            return {"ok": resp.status_code == 200, "model": "nomic-embed-text-v1.5"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}

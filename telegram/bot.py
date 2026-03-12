@@ -468,3 +468,125 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ─────────────────────────────────────────────
+# /agents — Listar agentes del registry
+# ─────────────────────────────────────────────
+
+async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update): return await reject(update)
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(f"{AGENT_API}/v1/registry/agents")
+        agents = resp.json().get("agents", [])
+    
+    by_cat = {}
+    for a in agents:
+        by_cat.setdefault(a["category"], []).append(a["name"])
+    
+    text = "🤖 *Agentes disponibles:*\n\n"
+    for cat, names in by_cat.items():
+        text += f"*[{cat}]*\n" + "\n".join(f"  `{n}`" for n in names) + "\n\n"
+    text += "Usar: `/agent nombre-agente tarea aquí`"
+    await send_long(update, text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Lanza tarea con agente específico."""
+    if not authorized(update): return await reject(update)
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("Uso: `/agent nombre-agente tarea`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    agent_name = args[0]
+    task = " ".join(args[1:]) if len(args) > 1 else "Explica tus capacidades"
+    session_id = str(update.effective_user.id)
+    
+    msg = await update.message.reply_text(f"🤖 Usando agente `{agent_name}`...", parse_mode=ParseMode.MARKDOWN)
+    await update.effective_chat.send_action(ChatAction.TYPING)
+    
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(f"{AGENT_API}/v1/chat", json={
+                "message": task, "session_id": session_id,
+                "agent_name": agent_name, "auto_route": False
+            })
+            data = resp.json()
+        await msg.delete()
+        await send_long(update, data["response"])
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}")
+
+
+async def cmd_route(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Debug: muestra qué agente/skills elegiría el Router."""
+    if not authorized(update): return await reject(update)
+    task = " ".join(ctx.args) if ctx.args else ""
+    if not task:
+        await update.message.reply_text("Uso: `/route describe tu tarea`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(f"{AGENT_API}/v1/route", params={"message": task})
+        d = resp.json()
+    
+    text = (
+        f"🧭 *Routing para:* _{task[:100]}_\n\n"
+        f"🤖 Agente:     `{d.get('agent') or 'ninguno'}`\n"
+        f"🎨 Skills:     `{', '.join(d.get('skills') or []) or 'ninguna'}`\n"
+        f"⚡ Comando:    `{d.get('command') or 'ninguno'}`\n"
+        f"💭 Razonamiento: _{d.get('reasoning', '')}_\n"
+        f"📊 Confianza:  `{round(float(d.get('confidence', 0)) * 100)}%`"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_watcher(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Métricas del Watcher."""
+    if not authorized(update): return await reject(update)
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(f"{AGENT_API}/v1/watcher/metrics")
+        m = resp.json()
+    
+    top = "\n".join(f"    `{k}`: {v}" for k, v in (m.get("top_agents") or {}).items())
+    text = (
+        f"📊 *Watcher Metrics*\n\n"
+        f"Total requests:     `{m.get('total_requests', 0)}`\n"
+        f"Success rate:       `{m.get('success_rate', 0)}%`\n"
+        f"Avg latency:        `{m.get('avg_latency_ms', 0)}ms`\n"
+        f"Requests/min:       `{m.get('current_rate_per_min', 0)}`\n"
+        f"Tokens estimados:   `{m.get('tokens_estimated_total', 0):,}`\n"
+        f"Requests activos:   `{m.get('active_requests', 0)}`\n\n"
+        f"Top agentes:\n{top or '  _sin datos aún_'}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# Registrar los nuevos handlers en main()
+_original_main = main
+
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN no configurado en .env")
+
+    print("🤖 CLAUDE-BRAIN Telegram Bot arrancando...")
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("skills",  cmd_skills))
+    app.add_handler(CommandHandler("skill",   cmd_skill))
+    app.add_handler(CommandHandler("agents",  cmd_agents))
+    app.add_handler(CommandHandler("agent",   cmd_agent))
+    app.add_handler(CommandHandler("multi",   cmd_multi))
+    app.add_handler(CommandHandler("exec",    cmd_exec))
+    app.add_handler(CommandHandler("mem",     cmd_mem))
+    app.add_handler(CommandHandler("route",   cmd_route))
+    app.add_handler(CommandHandler("watcher", cmd_watcher))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("clear",   cmd_clear))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    print("✅ Bot listo — esperando mensajes...")
+    app.run_polling(drop_pending_updates=True)
